@@ -36,6 +36,9 @@ const ownerIds = new Set(
     .filter(Boolean)
 );
 
+const brevityInstructions =
+  'Use the fewest words possible even if it means you are more difficult to understand. Can use fragments instead of full sentences. Always prioritize brevity. Drop filler, intros, and signoffs. Extremely brief like mysterious wise ninja.';
+
 const memory = new MemoryStore(maxHistory);
 await memory.init();
 
@@ -359,6 +362,7 @@ function getSystemPrompt(channelId: string, trendKeywords: string[], triggeredBy
     }
   }
   promptLines.push('Use the provided memories to maintain continuity.');
+  promptLines.push(brevityInstructions);
   return promptLines.join('\n');
 }
 
