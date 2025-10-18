@@ -122,11 +122,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
   if (message.channel.isDMBased()) return;
-  if (!message.content || !message.content.trim()) return;
-  if (message.content.length > 1900) return;
+
+  const botId = client.user?.id;
+  const mentionedDirectly = botId ? message.mentions.users.has(botId) : false;
+  const rawContent = message.content ?? '';
+  const trimmedContent = rawContent.trim();
+
+  if (!trimmedContent && !mentionedDirectly) return;
+  if (trimmedContent.length > 1900) return;
   if (allowedChannels.length > 0 && !allowedChannels.includes(message.channelId)) return;
 
-  const content = message.content.trim();
+  const mentionRegex = botId ? new RegExp(`<@!?${botId}>`, 'g') : null;
+  let content = mentionRegex ? trimmedContent.replace(mentionRegex, '').trim() : trimmedContent;
+  if (!content) {
+    content = mentionedDirectly ? 'Hello!' : '';
+  }
+  if (!content) return;
   const priorHistory = [...memory.getShortTerm(message.channelId)];
 
   try {
@@ -140,15 +151,13 @@ client.on(Events.MessageCreate, async (message) => {
     logger.error({ err: error }, 'Failed to store user message');
   }
 
-  if (!passiveEnabled) return;
-
   const lowerContent = content.toLowerCase();
   const trendKeywords = trendManager.getKeywords();
   const matchesTrend = trendKeywords.some((keyword) => lowerContent.includes(keyword));
-  const shouldRespondToTrend = matchesTrend && Math.random() < trendManager.getKeywordChance();
-  const shouldRespondRandomly = Math.random() < passiveRandomChance;
+  const shouldRespondToTrend = !mentionedDirectly && matchesTrend && Math.random() < trendManager.getKeywordChance();
+  const shouldRespondRandomly = !mentionedDirectly && Math.random() < passiveRandomChance;
 
-  if (!shouldRespondRandomly && !shouldRespondToTrend) {
+  if (!mentionedDirectly && (!passiveEnabled || (!shouldRespondRandomly && !shouldRespondToTrend))) {
     return;
   }
 
