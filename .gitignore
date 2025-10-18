@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+config.json
+auth.json
+token.txt
+
+# Cache / Data
+data/
+sessions/
+.cache/
+
+# Logs
+logs/
+*.log
+
+# Build
+dist/
+build/
+coverage/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
