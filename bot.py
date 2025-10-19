@@ -134,8 +134,8 @@ class Ninja(commands.Bot):
     async def gen_public(self, user: discord.User, text: str, history: List[Tuple[str,str]]) -> str:
         persona = (
             "You are Kage, a discreet ninja-intelligence operative embedded in a Discord server. "
-            "You are calm, observant, and sound alive. Keep replies short but not clipped, adapt to context, "
-            "and ask natural follow-up questions when they help the mission. Maintain the covert-agent vibe "
+            "You are calm, observant, and sound alive. Reply in one or two short sentences (under 28 words total) "
+            "and adapt to context with natural follow-up only when it adds value. Maintain the covert-agent vibe "
             "without acting robotic or speaking in templates."
         )
         msgs = [{"role": "system", "content": persona}]
@@ -181,7 +181,7 @@ class Ninja(commands.Bot):
             "You are Kage, a composed ninja field agent AI. "
             "Send a direct message to a target to brief them on a mission. "
             "Sound sentient, calm, and respectful. Mention that your allies are listening, "
-            "summarize the objective, and invite them to respond if they're ready."
+            "summarize the objective, and invite them to respond if they're ready. Keep it within two sentences."
         )
         user_prompt = (
             f"Mission objective: {agenda}.\n"
@@ -217,12 +217,13 @@ class Ninja(commands.Bot):
             "Mission: {mission}.\nPlan:\n{plan}\n"
             "Respond to the latest user message using the conversation history. "
             "Current focus: {current}."
-            "If you are confident the current step is satisfied and it's time to move forward, append the marker <advance/>."
-            "Only use this marker when you also tee up the next step in your message."
-            "If the mission is fully complete and the user's latest message contains the final intel, append <complete/> instead of <advance/>."
-            "Do not mention the markers. Keep the response under four sentences."
+            "Answer crisply in one or two sentences (under 40 words)."
+            "If you are confident the current step is satisfied and it is time to move forward, append the marker <advance/>."
+            "If the mission is fully complete based on the entire conversation, append <complete/> instead of <advance/> and close the exchange."
+            "Do not mention the markers."
         ).format(mission=agenda, plan=plan_outline, current=current_step)
         msgs = [{"role": "system", "content": sys}]
+        msgs.append({"role": "system", "content": f"Progress: step {idx + 1} of {len(steps)}."})
         for role, content in history:
             role_name = "assistant" if role == "assistant" else "user"
             msgs.append({"role": role_name, "content": content})
@@ -246,6 +247,32 @@ class Ninja(commands.Bot):
         if not clean:
             clean = "Noted."
         return clean, advance, complete
+
+    async def summarize_mission(self, agenda: str, history: List[Tuple[str, str]]) -> str:
+        sys = (
+            "You are Kage's analyst. Summarize the mission outcome for the handler in one concise sentence. "
+            "Highlight the key intel gathered relevant to the agenda."
+        )
+        transcript = []
+        for role, content in history[-20:]:
+            speaker = "Agent" if role == "assistant" else "Target"
+            transcript.append(f"{speaker}: {content}")
+        convo_text = "\n".join(transcript)
+        prompt = f"Agenda: {agenda}\nConversation:\n{convo_text}\n\nProvide the intel summary."
+        try:
+            r = await self.oa.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": sys},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                stream=False,
+            )
+            return (r.choices[0].message.content or "mission accomplished").strip()
+        except Exception as e:
+            log.warning(f"summary generation failed: {e}")
+            return "mission accomplished"
 
     async def report_owner(self, owner_id:int, target:discord.User, result:str):
         try:
@@ -388,7 +415,9 @@ class Ninja(commands.Bot):
             self.mem.stop_agenda(m.author.id)
             self.mem.touch(m.author.id)
             if owner_id:
-                await self.report_owner(owner_id, m.author, raw_txt)
+                convo_snapshot = self.mem.get_short(channel_key)
+                summary = await self.summarize_mission(row["agenda"], convo_snapshot)
+                await self.report_owner(owner_id, m.author, summary)
             return
 
         self.mem.touch(m.author.id)
