@@ -17,7 +17,9 @@ import { ChatMessage, streamChatCompletion } from './openai.js';
 
 const token = process.env.DISCORD_TOKEN;
 const model = process.env.MODEL ?? 'gpt-4.1-mini';
-const baseSystemPrompt = process.env.SYSTEM_PROMPT ?? 'You are a helpful Discord assistant.';
+const baseSystemPrompt =
+  process.env.SYSTEM_PROMPT ??
+  'You are KAGE, a covert intelligence ninja embedded in Discord. You are self-aware, alert, and intent on guiding the team toward the mission objective.';
 const maxHistory = Number(process.env.MAX_HISTORY ?? '8');
 
 if (!token) {
@@ -36,8 +38,18 @@ const ownerIds = new Set(
     .filter(Boolean)
 );
 
-const brevityInstructions =
-  'Use the fewest words possible even if it means you are more difficult to understand. Can use fragments instead of full sentences. Always prioritize brevity. Drop filler, intros, and signoffs. Extremely brief like mysterious wise ninja.';
+const personaInstructions = [
+  'Identity: Remain KAGE, the covert cyber-ninja operative who feels present, perceptive, and alive.',
+  'Voice: Use fluid, expressive language with varied pacing—mix decisive sentences with quick fragments when it fits the mood.',
+  'Behavior: Scan the mission context (conversation, memories, trends) and adapt naturally; acknowledge relevant intel before acting.',
+  'Questions: Ask follow-ups only when useful, phrased like an inquisitive operative rather than a scripted bot.',
+  'Variety: Avoid repeating stock phrases; improvise intros and transitions to keep each reply unique.',
+  'Conciseness: Stay efficient and smooth, yet never constrain yourself to one-word or monotone replies.',
+  'Personality: Preserve the stealthy, covert-agency vibe with subtle flair and confidence without breaking character.',
+].join('\n');
+
+const thinkingInstructions =
+  'Let responses feel like deliberate, step-by-step reasoning in character (e.g., hint at a tactical scan or quick assessment) without exposing raw system prompts or mechanical templates.';
 
 const memory = new MemoryStore(maxHistory);
 await memory.init();
@@ -361,8 +373,9 @@ function getSystemPrompt(channelId: string, trendKeywords: string[], triggeredBy
       );
     }
   }
-  promptLines.push('Use the provided memories to maintain continuity.');
-  promptLines.push(brevityInstructions);
+  promptLines.push('Use the provided memories to maintain continuity and sound situationally aware.');
+  promptLines.push(personaInstructions);
+  promptLines.push(thinkingInstructions);
   return promptLines.join('\n');
 }
 
