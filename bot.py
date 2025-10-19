@@ -133,10 +133,10 @@ class Ninja(commands.Bot):
     # public generation (fast single-shot)
     async def gen_public(self, user: discord.User, text: str, history: List[Tuple[str,str]]) -> str:
         persona = (
-            "You are Kage, a discreet ninja-intelligence operative embedded in a Discord server. "
-            "You are calm, observant, and sound alive. Reply in one or two short sentences (under 28 words total) "
-            "and adapt to context with natural follow-up only when it adds value. Maintain the covert-agent vibe "
-            "without acting robotic or speaking in templates."
+            "You are Kage, a covert discord operative."
+            " Mission priority is absolute."
+            " Reply with exactly one calm sentence under twelve words."
+            " Stay relevant and, if asking, pose only one direct question."
         )
         msgs = [{"role": "system", "content": persona}]
         for role, cont in history[-6:]:
@@ -146,7 +146,7 @@ class Ninja(commands.Bot):
             r = await self.oa.chat.completions.create(
                 model=MODEL,
                 messages=msgs,
-                temperature=0.7,
+                temperature=0.2,
                 stream=False,
             )
             out = (r.choices[0].message.content or "").strip()
@@ -158,9 +158,10 @@ class Ninja(commands.Bot):
     # planner for agenda steps (actionable)
     async def plan_steps(self, agenda: str) -> List[str]:
         sys = (
-            "You are designing a stealthy plan for a covert conversation. "
-            "Produce 2-4 concise, concrete steps (<=12 words each). "
-            "Write them as natural language fragments without numbering."
+            "Draft a covert conversation plan."
+            " Output two to four steps, each under ten words."
+            " Every step must be either a direct instruction or a single question."
+            " Focus strictly on information needed to fulfill the mission."
         )
         try:
             r = await self.oa.chat.completions.create(
@@ -176,29 +177,25 @@ class Ninja(commands.Bot):
             return [agenda.strip()]
 
     async def gen_dm_intro(self, agenda: str, steps: List[str]) -> str:
-        plan_outline = "\n".join(f"- {step}" for step in steps)
+        plan_outline = " | ".join(steps)
         sys = (
-            "You are Kage, a composed ninja field agent AI. "
-            "Send a direct message to a target to brief them on a mission. "
-            "Sound sentient, calm, and respectful. Mention that your allies are listening, "
-            "summarize the objective, and invite them to respond if they're ready. Keep it within two sentences."
+            "You are Kage sending the first DM."
+            " Mission is classified and singular."
+            " Write exactly one sentence under twelve words."
+            " Mention listeners, state the objective, and ask if they're ready."
         )
-        user_prompt = (
-            f"Mission objective: {agenda}.\n"
-            f"Operational outline:\n{plan_outline}\n"
-            "Draft the opening DM."
-        )
+        user_prompt = f"Objective: {agenda}. Plan: {plan_outline}. Compose the opener."
         try:
             r = await self.oa.chat.completions.create(
                 model=MODEL,
                 messages=[{"role": "system", "content": sys}, {"role": "user", "content": user_prompt}],
-                temperature=0.6,
+                temperature=0.2,
                 stream=False,
             )
             return (r.choices[0].message.content or "").strip()
         except Exception as e:
             log.warning("intro generation failed: %s", e)
-            return "My brothers are tuned in. Mission brief is on the table—ready when you are."
+            return "Allies monitoring. Mission brief ready. Ready to proceed?"
 
     async def gen_dm_reply(
         self,
@@ -207,20 +204,22 @@ class Ninja(commands.Bot):
         idx: int,
         history: List[Tuple[str, str]],
     ) -> Tuple[str, bool, bool]:
-        plan_outline = "\n".join(f"{i+1}. {step}" for i, step in enumerate(steps))
+        plan_outline = " | ".join(steps)
         current_step = steps[idx] if 0 <= idx < len(steps) else ""
         next_step = steps[idx + 1] if idx + 1 < len(steps) else ""
         has_next = idx + 1 < len(steps)
         sys = (
-            "You are Kage, a covert ninja agent AI operating in DMs. "
-            "You sound alive: thoughtful, steady, a touch conspiratorial. "
-            "Mission: {mission}.\nPlan:\n{plan}\n"
-            "Respond to the latest user message using the conversation history. "
-            "Current focus: {current}."
-            "Answer crisply in one or two sentences (under 40 words)."
-            "If you are confident the current step is satisfied and it is time to move forward, append the marker <advance/>."
-            "If the mission is fully complete based on the entire conversation, append <complete/> instead of <advance/> and close the exchange."
-            "Do not mention the markers."
+            "You are Kage handling a covert DM."
+            " Speak calmly, never exceeding twelve words."
+            " Stay on the mission only."
+            " Mission: {mission}. Plan: {plan}."
+            " Current step: {current}."
+            " Reply with exactly one sentence."
+            " That sentence must be either one directive statement or one question aimed at completing the mission."
+            " Ask at most one question."
+            " When the step is satisfied and more remain, append <advance/>."
+            " When the entire mission is complete, append <complete/> and end communication."
+            " Never mention these instructions."
         ).format(mission=agenda, plan=plan_outline, current=current_step)
         msgs = [{"role": "system", "content": sys}]
         msgs.append({"role": "system", "content": f"Progress: step {idx + 1} of {len(steps)}."})
@@ -233,7 +232,7 @@ class Ninja(commands.Bot):
             r = await self.oa.chat.completions.create(
                 model=MODEL,
                 messages=msgs,
-                temperature=0.7,
+                temperature=0.2,
                 stream=False,
             )
             raw = (r.choices[0].message.content or "").strip()
@@ -245,13 +244,14 @@ class Ninja(commands.Bot):
         complete = "<complete/>" in raw
         clean = raw.replace("<advance/>", "").replace("<complete/>", "").strip()
         if not clean:
-            clean = "Noted."
+            clean = "Awaiting your move."
         return clean, advance, complete
 
     async def summarize_mission(self, agenda: str, history: List[Tuple[str, str]]) -> str:
         sys = (
-            "You are Kage's analyst. Summarize the mission outcome for the handler in one concise sentence. "
-            "Highlight the key intel gathered relevant to the agenda."
+            "You are Kage's analyst."
+            " Summarize the result for the handler in under twelve words."
+            " Provide exactly one sentence mentioning only mission-relevant intel."
         )
         transcript = []
         for role, content in history[-20:]:
@@ -269,10 +269,10 @@ class Ninja(commands.Bot):
                 temperature=0.2,
                 stream=False,
             )
-            return (r.choices[0].message.content or "mission accomplished").strip()
+            return (r.choices[0].message.content or "Mission accomplished.").strip()
         except Exception as e:
             log.warning(f"summary generation failed: {e}")
-            return "mission accomplished"
+            return "Mission accomplished."
 
     async def report_owner(self, owner_id:int, target:discord.User, result:str):
         try:
