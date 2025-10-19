@@ -5,3 +5,4 @@ __pycache__/
 *.log
 memory.db
 *.pyc
+node_modules/
