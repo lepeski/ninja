@@ -122,58 +122,135 @@ class Ninja(commands.Bot):
         self.session = aiohttp.ClientSession()
         self.silenced_users: Dict[int, float] = {}  # user_id -> unmute_ts
 
-    # lowercase send helper
-    async def send_lc(self, dest: discord.abc.Messageable, text: str):
-        txt = (text or "").strip().lower()
-        if not txt: return
+    # send helper — keep persona voice intact
+    async def send_agent_message(self, dest: discord.abc.Messageable, text: str):
+        msg = (text or "").strip()
+        if not msg:
+            return
         with contextlib.suppress(Exception):
-            await dest.send(txt)
+            await dest.send(msg)
 
     # public generation (fast single-shot)
     async def gen_public(self, user: discord.User, text: str, history: List[Tuple[str,str]]) -> str:
-        sys = "you are concise and helpful. lowercase only. no filler. answer directly; if unclear ask one brief question."
-        msgs = [{"role":"system","content":sys}]
+        persona = (
+            "You are Kage, a discreet ninja-intelligence operative embedded in a Discord server. "
+            "You are calm, observant, and sound alive. Keep replies short but not clipped, adapt to context, "
+            "and ask natural follow-up questions when they help the mission. Maintain the covert-agent vibe "
+            "without acting robotic or speaking in templates."
+        )
+        msgs = [{"role": "system", "content": persona}]
         for role, cont in history[-6:]:
             msgs.append({"role": role, "content": cont})
-        msgs.append({"role":"user","content": text})
+        msgs.append({"role": "user", "content": text})
         try:
-            r = await self.oa.chat.completions.create(model=MODEL, messages=msgs, temperature=0.3, stream=False)
-            out = (r.choices[0].message.content or "").strip().lower()
-            return out or "ok."
+            r = await self.oa.chat.completions.create(
+                model=MODEL,
+                messages=msgs,
+                temperature=0.7,
+                stream=False,
+            )
+            out = (r.choices[0].message.content or "").strip()
+            return out or "Understood."
         except Exception as e:
             log.warning("public gen failed: %s", e)
-            return "sorry."
+            return "Glitched mid-thought. Give me a moment and try again."
 
     # planner for agenda steps (actionable)
     async def plan_steps(self, agenda: str) -> List[str]:
-        sys = "produce 2-4 ultra-brief actionable steps, <=8 words each, lowercase, no fluff."
+        sys = (
+            "You are designing a stealthy plan for a covert conversation. "
+            "Produce 2-4 concise, concrete steps (<=12 words each). "
+            "Write them as natural language fragments without numbering."
+        )
         try:
             r = await self.oa.chat.completions.create(
                 model=MODEL,
                 messages=[{"role":"system","content":sys},{"role":"user","content":agenda}],
                 temperature=0.2, stream=False)
-            text = (r.choices[0].message.content or "").strip().lower()
+            text = (r.choices[0].message.content or "").strip()
             lines = [ln.strip("-• ").strip() for ln in text.splitlines() if ln.strip()]
             steps = [ln for ln in lines if ln][:4]
-            return steps if steps else [agenda.strip().lower()]
+            return steps if steps else [agenda.strip()]
         except Exception as e:
             log.warning("planner failed: %s", e)
-            return [agenda.strip().lower()]
+            return [agenda.strip()]
 
-    # dm phrases (transparent)
-    def opener(self) -> str:
-        return "my brothers have sent me. we relay your answers back to them. are you ready?"
-    def reassure(self) -> str:
-        return "calm. answer simply."
-    def clarify(self) -> str:
-        return "one exact answer."
-    def closing(self) -> str:
-        return "thx. adios ^^/"
+    async def gen_dm_intro(self, agenda: str, steps: List[str]) -> str:
+        plan_outline = "\n".join(f"- {step}" for step in steps)
+        sys = (
+            "You are Kage, a composed ninja field agent AI. "
+            "Send a direct message to a target to brief them on a mission. "
+            "Sound sentient, calm, and respectful. Mention that your allies are listening, "
+            "summarize the objective, and invite them to respond if they're ready."
+        )
+        user_prompt = (
+            f"Mission objective: {agenda}.\n"
+            f"Operational outline:\n{plan_outline}\n"
+            "Draft the opening DM."
+        )
+        try:
+            r = await self.oa.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "system", "content": sys}, {"role": "user", "content": user_prompt}],
+                temperature=0.6,
+                stream=False,
+            )
+            return (r.choices[0].message.content or "").strip()
+        except Exception as e:
+            log.warning("intro generation failed: %s", e)
+            return "My brothers are tuned in. Mission brief is on the table—ready when you are."
+
+    async def gen_dm_reply(
+        self,
+        agenda: str,
+        steps: List[str],
+        idx: int,
+        history: List[Tuple[str, str]],
+    ) -> Tuple[str, bool, bool]:
+        plan_outline = "\n".join(f"{i+1}. {step}" for i, step in enumerate(steps))
+        current_step = steps[idx] if 0 <= idx < len(steps) else ""
+        next_step = steps[idx + 1] if idx + 1 < len(steps) else ""
+        has_next = idx + 1 < len(steps)
+        sys = (
+            "You are Kage, a covert ninja agent AI operating in DMs. "
+            "You sound alive: thoughtful, steady, a touch conspiratorial. "
+            "Mission: {mission}.\nPlan:\n{plan}\n"
+            "Respond to the latest user message using the conversation history. "
+            "Current focus: {current}."
+            "If you are confident the current step is satisfied and it's time to move forward, append the marker <advance/>."
+            "Only use this marker when you also tee up the next step in your message."
+            "If the mission is fully complete and the user's latest message contains the final intel, append <complete/> instead of <advance/>."
+            "Do not mention the markers. Keep the response under four sentences."
+        ).format(mission=agenda, plan=plan_outline, current=current_step)
+        msgs = [{"role": "system", "content": sys}]
+        for role, content in history:
+            role_name = "assistant" if role == "assistant" else "user"
+            msgs.append({"role": role_name, "content": content})
+        if has_next:
+            msgs.append({"role": "system", "content": f"Upcoming step: {next_step}"})
+        try:
+            r = await self.oa.chat.completions.create(
+                model=MODEL,
+                messages=msgs,
+                temperature=0.7,
+                stream=False,
+            )
+            raw = (r.choices[0].message.content or "").strip()
+        except Exception as e:
+            log.warning("dm reply generation failed: %s", e)
+            return ("Signal is noisy—say that again?", False, False)
+
+        advance = "<advance/>" in raw
+        complete = "<complete/>" in raw
+        clean = raw.replace("<advance/>", "").replace("<complete/>", "").strip()
+        if not clean:
+            clean = "Noted."
+        return clean, advance, complete
 
     async def report_owner(self, owner_id:int, target:discord.User, result:str):
         try:
             owner = await self.fetch_user(owner_id)
-            await self.send_lc(owner, f"mission complete — target: {target.display_name} — result: {result}")
+            await self.send_agent_message(owner, f"mission complete — target: {target.display_name} — result: {result}")
         except Exception as e:
             log.warning(f"report_owner failed: {e}")
 
@@ -201,9 +278,10 @@ class Ninja(commands.Bot):
                 await inter.response.send_message("owner only", ephemeral=True); return
             await inter.response.defer(ephemeral=True)
             steps = await self.plan_steps(agenda)
-            steps.insert(0, self.opener())
             self.mem.upsert_agenda(user.id, inter.user.id, agenda, steps)
-            await self.send_lc(user, steps[0])
+            intro = await self.gen_dm_intro(agenda, steps)
+            await self.send_agent_message(user, intro)
+            self.mem.add_short(-user.id, "assistant", intro)
             await inter.followup.send(f"quest begun for {user.display_name}", ephemeral=True)
 
         @self.tree.command(name="stopagenda", description="stop quest (owner only)")
@@ -256,7 +334,7 @@ class Ninja(commands.Bot):
         low = (m.content or "").strip().lower()
         silence_triggers = ("shut up","hush","stop talking","do not respond","do not reply","stfu","be quiet","don't respond","don't reply")
         if any(p in low for p in silence_triggers):
-            await self.send_lc(m.channel, "understood. i will be quiet.")
+            await self.send_agent_message(m.channel, "Understood. I’ll fade out for now.")
             self.silence_user(m.author.id)
             return
 
@@ -264,7 +342,7 @@ class Ninja(commands.Bot):
         resume_triggers = ("resume","speak","start","reply")
         if any(low.startswith(r) for r in resume_triggers):
             self.unsilence_user(m.author.id)
-            await self.send_lc(m.channel, "resumed.")
+            await self.send_agent_message(m.channel, "Back on comms.")
             return
 
         # rate limit
@@ -274,7 +352,7 @@ class Ninja(commands.Bot):
         # add short history and generate
         self.mem.add_short(m.channel.id, "user", m.content.strip())
         out = await self.gen_public(m.author, m.content.strip(), self.mem.get_short(m.channel.id))
-        await self.send_lc(m.channel, out)
+        await self.send_agent_message(m.channel, out)
         self.mem.add_short(m.channel.id, "assistant", out)
 
     # ----- dm agenda handler -----
@@ -285,46 +363,35 @@ class Ninja(commands.Bot):
 
         txt = (m.content or "").strip().lower()
         if any(p in txt for p in ("stop","leave me alone","go away","do not dm","stop dm")):
-            await self.send_lc(m.channel, "as you wish. we withdraw.")
+            await self.send_agent_message(m.channel, "Understood. Channel closed.")
             self.mem.stop_agenda(m.author.id); self.mem.touch(m.author.id); return
 
         steps = json.loads(row["steps"])
         idx = int(row["idx"])
         owner_id = int(row["owner_id"] or 0)
+        channel_key = -m.author.id
+        history = self.mem.get_short(channel_key)
+        # convert incoming message back to original casing for storage
+        raw_txt = (m.content or "").strip()
+        extended_history = history + [("user", raw_txt)]
 
-        # opener (idx 0): wait for yes-ish
-        if idx == 0:
-            if txt.startswith("y"):
-                self.mem.advance(m.author.id); self.mem.touch(m.author.id)
-                if len(steps) > 1:
-                    await self.send_lc(m.channel, steps[1])
-                else:
-                    await self.send_lc(m.channel, "proceed.")
-            else:
-                await self.send_lc(m.channel, "say yes to begin.")
-            return
+        reply, advance, complete = await self.gen_dm_reply(row["agenda"], steps, idx, extended_history)
 
-        # confusion -> brief reassure
-        if txt in ("what","huh","?","why","explain") or ("?" in txt and len(txt) < 40):
-            await self.send_lc(m.channel, self.reassure()); return
+        # persist history
+        self.mem.add_short(channel_key, "user", raw_txt)
+        await self.send_agent_message(m.channel, reply)
+        self.mem.add_short(channel_key, "assistant", reply)
 
-        # final step check (single-word result)
-        last_step = (idx >= len(steps)-1)
-        if last_step:
-            parts = txt.split()
-            if len(parts) != 1:
-                await self.send_lc(m.channel, self.clarify()); return
-            result = parts[0]
-            await self.send_lc(m.channel, self.closing())
-            self.mem.stop_agenda(m.author.id); self.mem.touch(m.author.id)
+        if advance and idx < len(steps) - 1:
+            self.mem.advance(m.author.id)
+        if complete:
+            self.mem.stop_agenda(m.author.id)
+            self.mem.touch(m.author.id)
             if owner_id:
-                await self.report_owner(owner_id, m.author, result)
+                await self.report_owner(owner_id, m.author, raw_txt)
             return
 
-        # otherwise advance and send next
-        self.mem.advance(m.author.id); self.mem.touch(m.author.id)
-        nxt = steps[idx+1] if idx+1 < len(steps) else steps[idx]
-        await self.send_lc(m.channel, nxt)
+        self.mem.touch(m.author.id)
 
     # ----- owner notification if no response in 24h (B2) -----
     async def agenda_watchdog(self):
@@ -340,7 +407,7 @@ class Ninja(commands.Bot):
                         # notify owner
                         with contextlib.suppress(Exception):
                             owner = await self.fetch_user(owner_id)
-                            await self.send_lc(owner, f"no response — target: {uid}")
+                            await self.send_agent_message(owner, f"no response — target: {uid}")
                         # stop quest to avoid repeated pings
                         self.mem.stop_agenda(uid)
                 await asyncio.sleep(600)  # check every 10 minutes
