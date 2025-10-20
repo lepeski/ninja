@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import sqlite3
@@ -86,6 +87,78 @@ class MemoryStore:
             lambda: deque(maxlen=MAX_HISTORY)
         )
         self._seen_first_contact: set[Tuple[str, str]] = set()
+        self._alias_by_user: Dict[Tuple[str, str], str] = {}
+        self._alias_index: Dict[Tuple[str, str], set[str]] = defaultdict(set)
+        self._load_alias_index()
+
+    @staticmethod
+    def _normalize_alias(alias: Optional[str]) -> str:
+        return str(alias or "").strip().lower()
+
+    def _alias_token(self, user_id: str) -> str:
+        digest = hashlib.sha1(str(user_id).encode("utf-8")).digest()
+        value = int.from_bytes(digest[:2], "big")
+        letters: List[str] = []
+        for _ in range(3):
+            letters.append(chr(ord("a") + (value % 26)))
+            value //= 26
+        return "".join(letters) or "aaa"
+
+    def _load_alias_index(self) -> None:
+        cur = self.conn.execute("SELECT platform, user_id, data FROM user_profiles")
+        for row in cur.fetchall():
+            platform = str(row["platform"])
+            user_id = str(row["user_id"])
+            try:
+                payload = json.loads(row["data"])
+            except json.JSONDecodeError:
+                continue
+            alias = payload.get("alias")
+            self._register_alias(platform, user_id, alias)
+
+    def _register_alias(self, platform: str, user_id: str, alias: Optional[str]) -> None:
+        key = (platform, str(user_id))
+        normalized_new = self._normalize_alias(alias)
+        current_alias = self._alias_by_user.get(key)
+        normalized_current = self._normalize_alias(current_alias)
+        if normalized_new == normalized_current:
+            if normalized_new and alias is not None and current_alias != alias:
+                self._alias_by_user[key] = alias
+            return
+        if normalized_current:
+            bucket_key = (platform, normalized_current)
+            bucket = self._alias_index.get(bucket_key)
+            if bucket:
+                bucket.discard(str(user_id))
+                if not bucket:
+                    self._alias_index.pop(bucket_key, None)
+        if normalized_new:
+            bucket_key = (platform, normalized_new)
+            bucket = self._alias_index.setdefault(bucket_key, set())
+            bucket.add(str(user_id))
+            if alias is not None:
+                self._alias_by_user[key] = alias
+        else:
+            self._alias_by_user.pop(key, None)
+
+    def alias_conflicts(self, platform: str, alias: str, user_id: str) -> bool:
+        normalized = self._normalize_alias(alias)
+        if not normalized:
+            return False
+        bucket = self._alias_index.get((platform, normalized))
+        if not bucket:
+            return False
+        others = {item for item in bucket if item != str(user_id)}
+        return bool(others)
+
+    def identity_blurb(
+        self, platform: str, user_id: str, fallback: Optional[str] = None
+    ) -> str:
+        alias = self.alias_for(platform, user_id, fallback=fallback)
+        marker = ""
+        if self.alias_conflicts(platform, alias, user_id):
+            marker = f"<{self._alias_token(user_id)}>"
+        return f"{alias}{marker} [{platform}:{user_id}]"
 
     def _init_db(self) -> None:
         with self.conn:
@@ -165,6 +238,7 @@ class MemoryStore:
                 """,
                 (platform, user_id, json.dumps(payload, ensure_ascii=False)),
             )
+        self._register_alias(platform, user_id, payload.get("alias"))
         self._write_profile_file(platform, user_id, payload)
 
     def _profile_path(self, platform: str, user_id: str) -> Path:
@@ -200,7 +274,11 @@ class MemoryStore:
             notes = profile.setdefault("notes", [])
             notes.append({"key": key, "value": value, "ts": time.time()})
             profile["notes"] = notes[-MEMORY_NOTES_LIMIT:]
-        if normalized_value and normalized_key in {"alias", "name", "callsign", "handle"}:
+        if (
+            normalized_value
+            and normalized_value.lower() != UNKNOWN_ALIAS
+            and normalized_key in {"alias", "name", "callsign", "handle"}
+        ):
             profile["alias"] = normalized_value
         self._save(platform, user_id, profile)
 
@@ -473,6 +551,7 @@ class Assistant:
         return (
             "ninja operates in lowercase fragments. concise, calm, direct."
             " use context, missions, and memory intelligently. only useful info."
+            " treat each platform:user_id as distinct identity; never merge aliases."
         )
 
     async def close(self) -> None:
@@ -518,6 +597,7 @@ class Assistant:
             target_missions=target_missions,
             is_dm=is_dm,
             user_id=user_id,
+            platform=platform,
         )
         messages_payload = [{"role": "system", "content": system_prompt}]
         for role, content in history:
@@ -570,6 +650,7 @@ class Assistant:
         target_missions: List[MissionRecord],
         is_dm: bool,
         user_id: str,
+        platform: str,
     ) -> str:
         def shorten(text: str, limit: int = 160) -> str:
             snippet = (text or "").strip()
@@ -607,14 +688,23 @@ class Assistant:
             if mission.status == "active" and mission.timeout:
                 remaining = max(0.0, mission.timeout - now)
                 status = f"active~{remaining/3600:.1f}h"
+            creator_label = self.memory.identity_blurb(
+                mission.platform,
+                mission.creator_user_id,
+            )
             target_alias = self.memory.alias_for(
                 mission.platform,
                 mission.target_user_id,
                 fallback=None,
             )
+            target_label = self.memory.identity_blurb(
+                mission.platform,
+                mission.target_user_id,
+                fallback=target_alias,
+            )
             line = (
-                f"{mission.mission_id}[{status}] target={target_alias}"
-                f" (id={mission.target_user_id}) :: {shorten(mission.objective)}"
+                f"{mission.mission_id}[{status}] you={creator_label}"
+                f" target={target_label} :: {shorten(mission.objective)}"
             )
             if mission.log:
                 last = mission.log[-1]
@@ -630,9 +720,18 @@ class Assistant:
                 mission.creator_user_id,
                 fallback=None,
             )
+            creator_label = self.memory.identity_blurb(
+                mission.platform,
+                mission.creator_user_id,
+                fallback=creator_alias,
+            )
+            target_label = self.memory.identity_blurb(
+                mission.platform,
+                mission.target_user_id,
+            )
             line = (
-                f"{mission.mission_id} creator={creator_alias}"
-                f" (id={mission.creator_user_id}) :: {shorten(mission.objective)}"
+                f"{mission.mission_id}[{mission.status}] you={target_label}"
+                f" creator={creator_label} :: {shorten(mission.objective)}"
             )
             if mission.log:
                 last = mission.log[-1]
@@ -640,6 +739,17 @@ class Assistant:
                 target_lines.append(f"{line} | last {last.get('actor', 'log')}:{text}")
             else:
                 target_lines.append(line)
+
+        roster: Dict[Tuple[str, str], str] = {}
+        for mission in owner_missions + target_missions:
+            roster[(mission.platform, mission.creator_user_id)] = self.memory.identity_blurb(
+                mission.platform,
+                mission.creator_user_id,
+            )
+            roster[(mission.platform, mission.target_user_id)] = self.memory.identity_blurb(
+                mission.platform,
+                mission.target_user_id,
+            )
 
         is_creator = bool(owner_missions)
         is_target = bool(target_missions)
@@ -666,6 +776,7 @@ class Assistant:
             "identity pressure: first ask redirect; second hint assignment; persistent -> short refusals (\"no.\" / \"irrelevant.\")",
             f"user: {username}",
             f"user_id: {user_id}",
+            f"contact: {self.memory.identity_blurb(platform, user_id, fallback=username)}",
             f"role: {role_label}",
             f"channel: {'dm' if is_dm else 'group'}",
             "memory: " + " | ".join(memory_bits),
@@ -678,6 +789,12 @@ class Assistant:
             prompt_parts.append(
                 "target_missions (internal, keep secret): " + " | ".join(target_lines)
             )
+        if roster:
+            roster_bits = [
+                f"{plat}:{uid}=>{label}"
+                for (plat, uid), label in roster.items()
+            ]
+            prompt_parts.append("roster: " + " | ".join(sorted(roster_bits)))
 
         return "\n".join(prompt_parts)
 
@@ -692,7 +809,7 @@ class Assistant:
         user_message: str,
         assistant_reply: str,
     ) -> None:
-        user_tag = f"{username}|{user_id}"
+        user_tag = self.memory.identity_blurb(platform, user_id, fallback=username)
         for mission in owner_missions:
             self.missions.append_log(
                 mission.mission_id,
@@ -731,6 +848,7 @@ class Assistant:
         extractor_system = (
             "You review the latest exchange and decide if anything should be saved as long-term memory. "
             "Return a JSON array of items with keys: category (preferences|facts|personality|notes), key, value. "
+            "Only store alias/name data if the user explicitly shared their own identity. "
             "Return an empty array if nothing matters."
         )
         payload = {
