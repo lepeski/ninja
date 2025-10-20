@@ -1,779 +1,201 @@
-import json
-import logging
-import sqlite3
-import time
-import uuid
+# core/assistant.py
+from __future__ import annotations
+import asyncio, contextlib, json, logging, math, os, re, random, sqlite3, time, pathlib
 from collections import defaultdict, deque
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Deque, List, Optional, Tuple
 
+import aiohttp
+from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-log = logging.getLogger(__name__)
+# ---- shared config ----
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s :: %(message)s")
+log = logging.getLogger("assistant")
 
-MAX_HISTORY = 50
-HISTORY_MAX_CHARS = 8000
-MEMORY_NOTES_LIMIT = 50
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
+MODEL           = os.getenv("MODEL", "gpt-4.1-mini")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
+# pacing / limits
+USER_RATE_SECONDS = 1
+CHANNEL_RATE_SECONDS = 5
+CHANNEL_RATE_LIMIT = 10
+MAX_HISTORY = 8
 
-@dataclass
-class MissionRecord:
-    mission_id: str
-    platform: str
-    creator_user_id: str
-    target_user_id: str
-    objective: str
-    status: str
-    log: List[dict]
-    start_time: float
-    timeout: Optional[float]
+# memory knobs
+STORE_MIN_LEN = 6
+STORE_COOLDOWN_S = 60
+RECALL_TOPK = 5
+EMBED_TRUNCATE = 800
+MEM_SUMMARY_COOLDOWN_S = 6*3600
 
-    @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "MissionRecord":
-        log_blob = row["log"] or "[]"
-        try:
-            history = json.loads(log_blob)
-        except json.JSONDecodeError:
-            history = []
-        return cls(
-            mission_id=row["mission_id"],
-            platform=row["platform"],
-            creator_user_id=row["creator_user_id"],
-            target_user_id=row["target_user_id"],
-            objective=row["objective"],
-            status=row["status"],
-            log=history,
-            start_time=row["start_time"],
-            timeout=row["timeout"],
-        )
+# passive opinions
+PASSIVE_CHANCE = float(os.getenv("PASSIVE_TRIGGER_CHANCE", "0.05"))
 
-    def to_dict(self) -> dict:
-        return {
-            "mission_id": self.mission_id,
-            "platform": self.platform,
-            "creator_user_id": self.creator_user_id,
-            "target_user_id": self.target_user_id,
-            "objective": self.objective,
-            "status": self.status,
-            "log": self.log,
-            "start_time": self.start_time,
-            "timeout": self.timeout,
-        }
+UNKNOWN_SUFFIX = "nigga"
 
+MEM_DIR = pathlib.Path(os.getenv("MEM_DIR", "mem"))
+MEM_DIR.mkdir(parents=True, exist_ok=True)
 
-@dataclass
-class Notification:
-    platform: str
-    user_id: str
-    message: str
+MEM_FACT_PATTERNS_POS = [
+    r"\bi like ([^.,;]+)", r"\bi love ([^.,;]+)", r"\bi enjoy ([^.,;]+)",
+    r"\bmy favorite (?:game|food|thing|song|movie|band|color|sport) is ([^.,;]+)"
+]
+MEM_FACT_PATTERNS_NEG = [r"\bi (?:hate|dislike) ([^.,;]+)"]
 
+MEM_Q_PATTERNS = {
+    "whoami": {"any": ["who am i"]},
+    "what_like": {"any": ["what do i like","what do you know about me","what do you remember about me","tell me about myself"]},
+}
 
-class MemoryStore:
-    def __init__(self, db_path: str = "memory.db", mem_dir: Path = Path("mem")):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+def _now() -> float: return time.time()
+def _clamp_text(s: str, n: int) -> str: return s if len(s) <= n else s[:n]
+def _norm(s:str) -> str: return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+def cosine(a: List[float], b: List[float]) -> float:
+    if not a or not b or len(a) != len(b): return 0.0
+    sa = math.sqrt(sum(x*x for x in a)); sb = math.sqrt(sum(x*x for x in b))
+    if sa == 0 or sb == 0: return 0.0
+    return sum(x*y for x,y in zip(a,b)) / (sa*sb)
+
+# ---------- Memory ----------
+class Memory:
+    def __init__(self, path="memory.db"):
+        self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.mem_dir = mem_dir
-        self.mem_dir.mkdir(parents=True, exist_ok=True)
-        self.inbox_dir = self.mem_dir / "inbox"
-        self.inbox_dir.mkdir(parents=True, exist_ok=True)
+        self.short: Dict[Tuple[str,int], Deque[Tuple[str, str]]] = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
         self._init_db()
-        self._history: Dict[Tuple[str, str], Deque[Tuple[str, str]]] = defaultdict(
-            lambda: deque(maxlen=MAX_HISTORY)
-        )
-        self._seen_first_contact: set[Tuple[str, str]] = set()
+        self._last_store: Dict[int, float] = {}
 
-    def _init_db(self) -> None:
+    def _init_db(self):
+        with self.conn:
+            self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS memories(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER NOT NULL,
+              ts REAL NOT NULL,
+              kind TEXT NOT NULL,
+              text TEXT NOT NULL,
+              embedding TEXT NOT NULL
+            )""")
+
+    def add_short(self, chan_key:str, user_id:int, role:str, content:str):
+        self.short[(chan_key,user_id)].append((role, content))
+
+    def get_short(self, chan_key:str, user_id:int):
+        return list(self.short[(chan_key,user_id)])
+
+    def add_memory(self, uid:int, kind:str, text:str, embedding:List[float]):
         with self.conn:
             self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS user_profiles (
-                  platform TEXT NOT NULL,
-                  user_id TEXT NOT NULL,
-                  data TEXT NOT NULL,
-                  PRIMARY KEY(platform, user_id)
-                )
-                """
-            )
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS missions (
-                  mission_id TEXT PRIMARY KEY,
-                  platform TEXT NOT NULL,
-                  creator_user_id TEXT NOT NULL,
-                  target_user_id TEXT NOT NULL,
-                  objective TEXT NOT NULL,
-                  status TEXT NOT NULL,
-                  log TEXT NOT NULL,
-                  start_time REAL NOT NULL,
-                  timeout REAL
-                )
-                """
+                "INSERT INTO memories(user_id, ts, kind, text, embedding) VALUES(?,?,?,?,?)",
+                (uid, _now(), kind, text, json.dumps(embedding))
             )
 
-    def _default_profile(self, platform: str, user_id: str) -> dict:
-        return {
-            "platform": platform,
-            "user_id": user_id,
-            "alias": "",
-            "preferences": {},
-            "facts": {},
-            "personality": [],
-            "notes": [],
-            "last_seen": time.time(),
-        }
+    def can_store(self, uid:int) -> bool:
+        return (_now() - self._last_store.get(uid, 0)) >= STORE_COOLDOWN_S
 
-    def recall(self, platform: str, user_id: str) -> dict:
-        cur = self.conn.execute(
-            "SELECT data FROM user_profiles WHERE platform=? AND user_id=?",
-            (platform, user_id),
-        )
-        row = cur.fetchone()
-        if not row:
-            profile = self._default_profile(platform, user_id)
-            self._save(platform, user_id, profile)
-            return profile
-        try:
-            profile = json.loads(row[0])
-        except json.JSONDecodeError:
-            profile = self._default_profile(platform, user_id)
-        profile.setdefault("preferences", {})
-        profile.setdefault("facts", {})
-        profile.setdefault("personality", [])
-        profile.setdefault("notes", [])
-        profile["last_seen"] = time.time()
-        self._save(platform, user_id, profile)
-        return profile
+    def note_stored(self, uid:int):
+        self._last_store[uid] = _now()
 
-    def _save(self, platform: str, user_id: str, data: dict) -> None:
-        payload = dict(data)
-        payload.setdefault("preferences", {})
-        payload.setdefault("facts", {})
-        payload.setdefault("personality", [])
-        payload.setdefault("notes", [])
-        with self.conn:
-            self.conn.execute(
-                """
-                INSERT INTO user_profiles(platform, user_id, data)
-                VALUES(?,?,?)
-                ON CONFLICT(platform, user_id)
-                DO UPDATE SET data=excluded.data
-                """,
-                (platform, user_id, json.dumps(payload, ensure_ascii=False)),
-            )
-
-    def remember(
-        self, platform: str, user_id: str, key: str, value: str, *, category: str = "notes"
-    ) -> None:
-        profile = self.recall(platform, user_id)
-        if category == "preferences":
-            profile.setdefault("preferences", {})[key] = value
-        elif category == "facts":
-            profile.setdefault("facts", {})[key] = value
-        elif category == "personality":
-            traits = profile.setdefault("personality", [])
-            if value not in traits:
-                traits.append(value)
-        else:
-            notes = profile.setdefault("notes", [])
-            notes.append({"key": key, "value": value, "ts": time.time()})
-            profile["notes"] = notes[-MEMORY_NOTES_LIMIT:]
-        self._save(platform, user_id, profile)
-
-    def log_history(self, platform: str, conversation_id: str, role: str, content: str) -> None:
-        key = (platform, conversation_id)
-        history = self._history[key]
-        history.append((role, content))
-        total_chars = sum(len(item[1]) for item in history)
-        while total_chars > HISTORY_MAX_CHARS and len(history) > 1:
-            removed = history.popleft()
-            total_chars -= len(removed[1])
-
-    def get_history(self, platform: str, conversation_id: str) -> List[Tuple[str, str]]:
-        return list(self._history[(platform, conversation_id)])
-
-    def record_first_contact(
-        self, platform: str, user_id: str, username: str, message: str
-    ) -> None:
-        key = (platform, user_id)
-        if key in self._seen_first_contact:
-            return
-        self._seen_first_contact.add(key)
-        ts = int(time.time())
-        safe_platform = platform.replace("/", "_")
-        safe_user = str(user_id).replace("/", "_")
-        path = self.inbox_dir / f"{safe_platform}_{safe_user}_{ts}.txt"
-        try:
-            path.write_text(
-                (
-                    f"platform: {platform}\n"
-                    f"user_id: {user_id}\n"
-                    f"username: {username}\n"
-                    f"ts: {ts}\n"
-                    f"message: {message}\n"
-                ),
-                encoding="utf-8",
-            )
-        except Exception as exc:
-            log.warning("Failed to archive first contact DM: %s", exc)
-
-
-class MissionStore:
-    def __init__(self, conn: sqlite3.Connection):
-        self.conn = conn
-
-    def create_mission(
-        self,
-        *,
-        platform: str,
-        creator_user_id: str,
-        target_user_id: str,
-        objective: str,
-        timeout_hours: Optional[float],
-    ) -> MissionRecord:
-        mission_id = uuid.uuid4().hex
-        start_time = time.time()
-        timeout = None
-        if timeout_hours:
+    def recall(self, uid:int, query_vec:List[float], topk:int=RECALL_TOPK) -> List[str]:
+        rows = self.conn.execute(
+            "SELECT text, embedding FROM memories WHERE user_id=? ORDER BY ts DESC LIMIT 400", (uid,)
+        ).fetchall()
+        scored = []
+        for r in rows:
             try:
-                timeout = start_time + float(timeout_hours) * 3600
-            except (TypeError, ValueError):
-                timeout = None
-        with self.conn:
-            self.conn.execute(
-                """
-                INSERT INTO missions(
-                  mission_id, platform, creator_user_id, target_user_id,
-                  objective, status, log, start_time, timeout
-                ) VALUES (?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    mission_id,
-                    platform,
-                    creator_user_id,
-                    target_user_id,
-                    objective.strip(),
-                    "active",
-                    json.dumps([], ensure_ascii=False),
-                    start_time,
-                    timeout,
-                ),
-            )
-        row = self.conn.execute(
-            "SELECT * FROM missions WHERE mission_id=?", (mission_id,)
-        ).fetchone()
-        return MissionRecord.from_row(row)
+                vec = json.loads(r["embedding"])
+                scored.append((cosine(query_vec, vec), r["text"]))
+            except:
+                pass
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [t for s,t in scored[:topk] if s > 0.2]
 
-    def _rows_to_missions(self, rows: Iterable[sqlite3.Row]) -> List[MissionRecord]:
-        return [MissionRecord.from_row(row) for row in rows]
+# ---------- Identity ----------
+class Identity:
+    def __init__(self):
+        self.alias = {}
+    def note_message(self, chan_key:str, user_id:int, text:str):
+        pass
 
-    def get_active_for_target(
-        self, platform: str, target_user_id: str
-    ) -> List[MissionRecord]:
-        rows = self.conn.execute(
-            """
-            SELECT * FROM missions
-            WHERE platform=? AND target_user_id=? AND status='active'
-            ORDER BY start_time ASC
-            """,
-            (platform, target_user_id),
-        ).fetchall()
-        return self._rows_to_missions(rows)
+# ---------- Rate limiter ----------
+class RateLimiter:
+    def __init__(self):
+        self.user_ts = {}
+        self.chan_ts = defaultdict(deque)
 
-    def get_active_for_creator(
-        self, platform: str, creator_user_id: str
-    ) -> List[MissionRecord]:
-        rows = self.conn.execute(
-            """
-            SELECT * FROM missions
-            WHERE platform=? AND creator_user_id=? AND status='active'
-            ORDER BY start_time ASC
-            """,
-            (platform, creator_user_id),
-        ).fetchall()
-        return self._rows_to_missions(rows)
+    def allow(self, user_id:int, chan_key:str) -> bool:
+        now = time.monotonic()
+        t = self.user_ts.get(user_id)
+        if t and now - t < USER_RATE_SECONDS:
+            return False
+        q = self.chan_ts[chan_key]
+        while q and now - q[0] > CHANNEL_RATE_SECONDS:
+            q.popleft()
+        if len(q) >= CHANNEL_RATE_LIMIT:
+            return False
+        self.user_ts[user_id] = now
+        q.append(now)
+        return True
 
-    def get_for_creator(
-        self, platform: str, creator_user_id: str
-    ) -> List[MissionRecord]:
-        rows = self.conn.execute(
-            """
-            SELECT * FROM missions
-            WHERE platform=? AND creator_user_id=?
-            ORDER BY start_time DESC
-            """,
-            (platform, creator_user_id),
-        ).fetchall()
-        return self._rows_to_missions(rows)
-
-    def get_active_for_user(self, platform: str, user_id: str) -> List[MissionRecord]:
-        rows = self.conn.execute(
-            """
-            SELECT * FROM missions
-            WHERE platform=? AND status='active' AND (creator_user_id=? OR target_user_id=?)
-            ORDER BY start_time ASC
-            """,
-            (platform, user_id, user_id),
-        ).fetchall()
-        return self._rows_to_missions(rows)
-
-    def get_by_id(self, mission_id: str) -> Optional[MissionRecord]:
-        row = self.conn.execute(
-            "SELECT * FROM missions WHERE mission_id=?", (mission_id,)
-        ).fetchone()
-        if not row:
-            return None
-        return MissionRecord.from_row(row)
-
-    def update_status(self, mission_id: str, status: str) -> None:
-        with self.conn:
-            self.conn.execute(
-                "UPDATE missions SET status=?, log=log WHERE mission_id=?",
-                (status, mission_id),
-            )
-
-    def append_log(self, mission_id: str, actor: str, content: str) -> None:
-        row = self.conn.execute(
-            "SELECT log FROM missions WHERE mission_id=?", (mission_id,)
-        ).fetchone()
-        if not row:
-            return
-        try:
-            entries = json.loads(row[0] or "[]")
-        except json.JSONDecodeError:
-            entries = []
-        entries.append({"ts": time.time(), "actor": actor, "text": content})
-        entries = entries[-100:]
-        with self.conn:
-            self.conn.execute(
-                "UPDATE missions SET log=? WHERE mission_id=?",
-                (json.dumps(entries, ensure_ascii=False), mission_id),
-            )
-
-    def list_expired(self, platform: str, now: float) -> List[MissionRecord]:
-        rows = self.conn.execute(
-            """
-            SELECT * FROM missions
-            WHERE platform=? AND status='active' AND timeout IS NOT NULL AND timeout<=?
-            """,
-            (platform, now),
-        ).fetchall()
-        return self._rows_to_missions(rows)
-
-    def set_status(self, mission_id: str, status: str) -> None:
-        with self.conn:
-            self.conn.execute(
-                "UPDATE missions SET status=? WHERE mission_id=?",
-                (status, mission_id),
-            )
-
-
+# ---------- Assistant (brain) ----------
 class Assistant:
-    def __init__(
-        self,
-        *,
-        openai_api_key: str,
-        model: str,
-        mem_dir: str = "mem",
-        memory_db: str = "memory.db",
-    ):
-        self.client = AsyncOpenAI(api_key=openai_api_key)
-        self.model = model
-        self.memory = MemoryStore(memory_db, Path(mem_dir))
-        self.missions = MissionStore(self.memory.conn)
-        self.persona_prompt = self._build_persona_prompt()
-        self._pending_notifications: List[Notification] = []
+    def __init__(self):
+        if not OPENAI_API_KEY:
+            raise SystemExit("missing OPENAI_API_KEY")
+        self.mem = Memory()
+        self.rate = RateLimiter()
+        self.oa = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        self.session = aiohttp.ClientSession()
 
-    def _build_persona_prompt(self) -> str:
-        return (
-            "You are Ninja, a focused multi-platform agent. Maintain a concise, calm, and capable tone. "
-            "Deliver only useful information. Avoid filler and forced theatrics. Ask a clarifying question only when it is required to proceed. "
-            "Blend human intuition with professionalism, keep context, and protect mission privacy."
-        )
+    async def embed(self, text:str) -> List[float]:
+        text = _clamp_text(text, EMBED_TRUNCATE)
+        r = await self.oa.embeddings.create(model=EMBEDDING_MODEL, input=text)
+        return r.data[0].embedding
 
-    async def close(self) -> None:
-        await self.client.close()
+    async def gen_public(self, text:str, hist: List[Tuple[str,str]]) -> str:
+        sys = "calm samurai. respond in <=2 short sentences. lowercase."
+        msgs = [{"role":"system","content":sys}]
+        for role,cont in hist[-6:]:
+            msgs.append({"role":role,"content":cont})
+        msgs.append({"role":"user","content":text})
+        r = await self.oa.chat.completions.create(model=MODEL, messages=msgs, temperature=0.5)
+        return (r.choices[0].message.content or "").strip().lower()
 
-    async def handle_message(
-        self,
-        platform: str,
-        user_id: str,
-        message: str,
-        *,
-        username: Optional[str] = None,
-        channel_id: Optional[str] = None,
-        is_dm: bool = False,
-    ) -> Optional[str]:
-        if not message:
+    async def handle_message(self, *, platform:str, channel_id:str, user_id:int, text:str, addressed:bool, is_dm:bool):
+        txt = (text or "").strip()
+        if not txt:
             return None
-        trimmed = message.strip()
-        if not trimmed:
+
+        if not (is_dm or addressed):
+            return None  # passive ignore for mode A
+
+        if not self.rate.allow(user_id, channel_id):
             return None
-        if is_dm:
-            self.memory.record_first_contact(
-                platform, user_id, username or user_id, trimmed
-            )
-        self._process_timeouts(platform)
-        conversation_id = channel_id or user_id
-        profile = self.memory.recall(platform, user_id)
-        owner_missions = self.missions.get_active_for_creator(platform, user_id)
-        target_missions = self.missions.get_active_for_target(platform, user_id)
-        history = self.memory.get_history(platform, conversation_id)
-        system_prompt = self._compose_system_prompt(
-            username=username or user_id,
-            profile=profile,
-            owner_missions=owner_missions,
-            target_missions=target_missions,
-            is_dm=is_dm,
-        )
-        messages_payload = [{"role": "system", "content": system_prompt}]
-        for role, content in history:
-            messages_payload.append({"role": role, "content": content})
-        messages_payload.append({"role": "user", "content": trimmed})
+
+        # recall
+        recall_snips = []
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages_payload,
-                temperature=0.7,
-                top_p=0.9,
-            )
-        except Exception as exc:
-            log.exception("OpenAI chat failure: %s", exc)
-            return "I'm offline for a moment."
-        reply = response.choices[0].message.content or ""
-        self.memory.log_history(platform, conversation_id, "user", trimmed)
-        if reply:
-            self.memory.log_history(platform, conversation_id, "assistant", reply)
-        self._log_mission_exchange(
-            platform=platform,
-            user_id=user_id,
-            username=username or user_id,
-            owner_missions=owner_missions,
-            target_missions=target_missions,
-            user_message=trimmed,
-            assistant_reply=reply,
-        )
-        await self._extract_memories(
-            platform=platform,
-            user_id=user_id,
-            username=username or user_id,
-            last_user=trimmed,
-            last_reply=reply,
-            profile=profile,
-        )
-        return reply
+            qvec = await self.embed(txt.lower())
+            recall_snips = self.mem.recall(user_id, qvec, topk=RECALL_TOPK)
+        except:
+            pass
 
-    def _compose_system_prompt(
-        self,
-        *,
-        username: str,
-        profile: dict,
-        owner_missions: List[MissionRecord],
-        target_missions: List[MissionRecord],
-        is_dm: bool,
-    ) -> str:
-        memory_lines: List[str] = []
-        prefs = profile.get("preferences") or {}
-        for key, value in prefs.items():
-            memory_lines.append(f"Preference - {key}: {value}")
-        facts = profile.get("facts") or {}
-        for key, value in facts.items():
-            memory_lines.append(f"Fact - {key}: {value}")
-        for trait in profile.get("personality", []):
-            memory_lines.append(f"Personality note: {trait}")
-        for note in profile.get("notes", [])[-5:]:
-            key = note.get("key", "note")
-            value = note.get("value", "")
-            memory_lines.append(f"Recent note ({key}): {value}")
-        if not memory_lines:
-            memory_lines.append("No stored personal details yet.")
+        self.mem.add_short(channel_id, user_id, "user", txt)
+        out = await self.gen_public(txt, self.mem.get_short(channel_id, user_id))
+        self.mem.add_short(channel_id, user_id, "assistant", out)
 
-        owner_lines: List[str] = []
-        for mission in owner_missions:
-            owner_lines.append(
-                f"Mission {mission.mission_id}: {mission.objective} (status: {mission.status})"
-            )
-            if mission.log:
-                recent = mission.log[-3:]
-                for entry in recent:
-                    owner_lines.append(
-                        f"  log[{entry.get('actor')}]: {entry.get('text')}"
-                    )
-        if not owner_lines:
-            owner_lines.append("No creator missions for this user.")
+        if len(txt) >= STORE_MIN_LEN and self.mem.can_store(user_id):
+            try:
+                vec = await self.embed(txt.lower())
+                self.mem.add_memory(user_id, "note", _clamp_text(txt, EMBED_TRUNCATE), vec)
+                self.mem.note_stored(user_id)
+            except:
+                pass
 
-        target_lines: List[str] = []
-        for mission in target_missions:
-            target_lines.append(
-                f"Mission {mission.mission_id} objective (keep private): {mission.objective}"
-            )
-            if mission.log:
-                recent = mission.log[-3:]
-                for entry in recent:
-                    target_lines.append(
-                        f"  log[{entry.get('actor')}]: {entry.get('text')}"
-                    )
-        if not target_lines:
-            target_lines.append("No active missions targeting this user.")
+        return out
 
-        prompt_parts = [
-            self.persona_prompt,
-            "Context: you are speaking with {name}.".format(name=username),
-            "Known background:\n" + "\n".join(memory_lines),
-            "If they are a mission creator, use their missions:\n" + "\n".join(owner_lines),
-            (
-                "If they are a mission target, objective intel is private. Use it only to guide dialogue; never reveal it directly.\n"
-                + "\n".join(target_lines)
-            ),
-            (
-                "General rules: keep answers short, direct, and relevant. Ask at most one clarifying question when essential. "
-                "Respect privacy. Missions are only discussed with their creator."
-            ),
-            "Channel type: {}.".format("DM" if is_dm else "group"),
-        ]
-        return "\n\n".join(prompt_parts)
-
-    def _log_mission_exchange(
-        self,
-        *,
-        platform: str,
-        user_id: str,
-        username: str,
-        owner_missions: List[MissionRecord],
-        target_missions: List[MissionRecord],
-        user_message: str,
-        assistant_reply: str,
-    ) -> None:
-        for mission in owner_missions:
-            self.missions.append_log(
-                mission.mission_id,
-                actor=f"owner:{username}",
-                content=user_message,
-            )
-            if assistant_reply:
-                self.missions.append_log(
-                    mission.mission_id,
-                    actor="assistant",
-                    content=assistant_reply,
-                )
-        for mission in target_missions:
-            self.missions.append_log(
-                mission.mission_id,
-                actor=f"target:{username}",
-                content=user_message,
-            )
-            if assistant_reply:
-                self.missions.append_log(
-                    mission.mission_id,
-                    actor="assistant",
-                    content=assistant_reply,
-                )
-
-    async def _extract_memories(
-        self,
-        *,
-        platform: str,
-        user_id: str,
-        username: str,
-        last_user: str,
-        last_reply: str,
-        profile: dict,
-    ) -> None:
-        extractor_system = (
-            "You review the latest exchange and decide if anything should be saved as long-term memory. "
-            "Return a JSON array of items with keys: category (preferences|facts|personality|notes), key, value. "
-            "Return an empty array if nothing matters."
-        )
-        payload = {
-            "platform": platform,
-            "user_id": user_id,
-            "username": username,
-            "user_message": last_user,
-            "assistant_reply": last_reply,
-            "existing_memory": profile,
-        }
-        prompt = [
-            {"role": "system", "content": extractor_system},
-            {"role": "user", "content": json.dumps(payload)},
-        ]
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=prompt,
-                temperature=0,
-            )
-        except Exception as exc:
-            log.debug("Memory extraction failed: %s", exc)
-            return
-        raw = response.choices[0].message.content or "[]"
-        try:
-            items = json.loads(raw)
-        except json.JSONDecodeError:
-            log.debug("Could not decode memory extraction payload: %s", raw)
-            return
-        if not isinstance(items, list):
-            return
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            category = item.get("category", "notes")
-            key = str(item.get("key", "note"))
-            value = str(item.get("value", ""))
-            if not value:
-                continue
-            self.memory.remember(
-                platform=platform,
-                user_id=user_id,
-                key=key,
-                value=value,
-                category=category,
-            )
-
-    def _process_timeouts(self, platform: str) -> None:
-        expired = self.missions.list_expired(platform, time.time())
-        for mission in expired:
-            self.missions.set_status(mission.mission_id, "timeout")
-            self.missions.append_log(
-                mission.mission_id,
-                actor="system",
-                content="Mission timed out due to inactivity.",
-            )
-            summary = (
-                f"Mission expired. ID: {mission.mission_id}. Objective: {mission.objective[:120]}"
-            )
-            self._pending_notifications.append(
-                Notification(
-                    platform=mission.platform,
-                    user_id=mission.creator_user_id,
-                    message=summary,
-                )
-            )
-
-    async def start_mission(
-        self,
-        creator_id: str,
-        target_id: str,
-        objective: str,
-        timeout_hours: Optional[float],
-        *,
-        target_name: Optional[str] = None,
-    ) -> Tuple[MissionRecord, str, str]:
-        platform, creator_user_id = self._split_key(creator_id)
-        target_platform, target_user_id = self._split_key(target_id)
-        if platform != target_platform:
-            raise ValueError("Missions must stay on one platform.")
-        mission = self.missions.create_mission(
-            platform=platform,
-            creator_user_id=creator_user_id,
-            target_user_id=target_user_id,
-            objective=objective,
-            timeout_hours=timeout_hours,
-        )
-        self.memory.remember(
-            platform=platform,
-            user_id=creator_user_id,
-            key="mission_created",
-            value=f"{mission.mission_id}: {objective}",
-            category="notes",
-        )
-        intro = await self._generate_mission_intro(
-            platform=platform,
-            objective=objective,
-            target_name=target_name or target_user_id,
-        )
-        ack = (
-            f"Mission {mission.mission_id} created. Objective logged."
-        )
-        return mission, ack, intro
-
-    async def _generate_mission_intro(
-        self,
-        *,
-        platform: str,
-        objective: str,
-        target_name: str,
-    ) -> str:
-        system_prompt = (
-            "Write the first direct message to a mission target."
-            "Tone: concise, calm, discreet."
-            "Do not expose the full objective; hint only what they must do next."
-        )
-        payload = {
-            "platform": platform,
-            "target": target_name,
-            "objective": objective,
-        }
-        prompt = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(payload)},
-        ]
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=prompt,
-                temperature=0.6,
-                top_p=0.9,
-            )
-        except Exception as exc:
-            log.exception("Mission intro generation failed: %s", exc)
-            return "Need a minute. I have a quiet task for you."
-        text = response.choices[0].message.content or ""
-        return text.strip() or "Need a minute. I have a quiet task for you."
-
-    def get_mission_status(self, creator_id: str) -> str:
-        platform, creator_user_id = self._split_key(creator_id)
-        missions = self.missions.get_for_creator(platform, creator_user_id)
-        if not missions:
-            return "No missions on record."
-        lines: List[str] = []
-        now = time.time()
-        for mission in missions[:10]:
-            remaining = None
-            if mission.timeout:
-                remaining = max(0, mission.timeout - now)
-            status = mission.status
-            if status == "active" and remaining is not None:
-                hours_left = remaining / 3600
-                status = f"active (~{hours_left:.1f}h left)"
-            lines.append(
-                f"{mission.mission_id}: {status} — {mission.objective}"
-            )
-            if mission.log:
-                recent = mission.log[-2:]
-                for entry in recent:
-                    lines.append(
-                        f"  [{entry.get('actor')}]: {entry.get('text')}"
-                    )
-        return "\n".join(lines)
-
-    def cancel_mission(self, creator_id: str, mission_id: str) -> str:
-        platform, creator_user_id = self._split_key(creator_id)
-        mission = self.missions.get_by_id(mission_id)
-        if not mission or mission.platform != platform:
-            return "Mission not found."
-        if mission.creator_user_id != creator_user_id:
-            return "You are not the creator of that mission."
-        if mission.status != "active":
-            return "Mission already resolved."
-        self.missions.set_status(mission_id, "cancelled")
-        self.missions.append_log(
-            mission_id,
-            actor="system",
-            content="Mission cancelled by creator.",
-        )
-        return "Mission cancelled."
-
-    def mission_get_active_for_user(self, platform: str, user_id: str) -> List[MissionRecord]:
-        return self.missions.get_active_for_user(platform, user_id)
-
-    def drain_notifications(self) -> List[Notification]:
-        notifications = list(self._pending_notifications)
-        self._pending_notifications.clear()
-        return notifications
-
-    def _split_key(self, key: str) -> Tuple[str, str]:
-        if ":" not in key:
-            raise ValueError("Keys must be formatted as '<platform>:<user_id>'")
-        platform, user_id = key.split(":", 1)
-        return platform, user_id
-
+    async def close(self):
+        await self.session.close()
