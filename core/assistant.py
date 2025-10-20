@@ -667,11 +667,11 @@ class Assistant:
             ) or "what is this" in lowered
 
         def is_confused() -> bool:
-            stripped = lowered.strip(" ?!.")
+            stripped = lowered.strip(" ?!.\n")
             return (
                 not text
                 or stripped in {"?", "??", "???", "what", "huh", "who"}
-                or "?" in lowered
+                or ("?" in lowered and len(stripped) <= 3)
             )
 
         def is_vague() -> bool:
@@ -680,11 +680,19 @@ class Assistant:
         def agenda_prompt(step_text: str, idx: int) -> str:
             step_text = step_text.strip()
             if idx == 0:
-                return f"goal: {agenda.goal}. focus. {step_text}"
+                return f"orders received. {step_text}"
             return f"focus. {step_text}"
 
         def remind_step(step_text: str) -> str:
             return f"answer plainly. {step_text.strip()}"
+
+        def is_detail_request() -> bool:
+            if "?" not in lowered:
+                return False
+            detail_words = {"which", "what", "where", "when", "who", "how"}
+            if len(tokens & detail_words) == 1 and len(tokens) == 1:
+                return False
+            return bool(tokens & detail_words)
 
         def refuse_response() -> AssistantResponse:
             if not agenda.warned:
@@ -793,7 +801,26 @@ class Assistant:
                 idx=agenda.idx,
                 warned=agenda.warned,
             )
-            return AssistantResponse(reply="friends sent me. stay on task.")
+            return AssistantResponse(reply="shadows want answers. stay on task.")
+        if is_detail_request():
+            owner_msgs: List[Tuple[str, str]] = []
+            if agenda.owner_id:
+                owner_msgs.append(
+                    (
+                        agenda.owner_id,
+                        f"{username} needs detail on step {agenda.idx + 1}: {text.strip()}",
+                    )
+                )
+            self.memory.update_agenda_state(
+                platform,
+                user_id,
+                idx=agenda.idx,
+                warned=agenda.warned,
+            )
+            return AssistantResponse(
+                reply=f"no detail given. I'll ask. {remind_step(current_step)}",
+                owner_messages=owner_msgs,
+            )
         if is_confused():
             self.memory.update_agenda_state(
                 platform,
@@ -801,7 +828,7 @@ class Assistant:
                 idx=agenda.idx,
                 warned=agenda.warned,
             )
-            return AssistantResponse(reply=f"I asked: {current_step.strip()}")
+            return AssistantResponse(reply=f"clarify your answer. {remind_step(current_step)}")
         if is_vague():
             self.memory.update_agenda_state(
                 platform,
