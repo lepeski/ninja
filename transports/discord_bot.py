@@ -5,6 +5,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from core.assistant import Notification
+
 log = logging.getLogger(__name__)
 
 
@@ -29,15 +31,24 @@ class DiscordTransport(commands.Bot):
 
     def _assign_agenda(self) -> app_commands.Command:
         @app_commands.command(name="assignagenda", description="Assign a mission to a user")
-        @app_commands.describe(user="Target user", goal="Mission goal")
-        async def assignagenda(interaction: discord.Interaction, user: discord.User, goal: str):
+        @app_commands.describe(
+            user="Target user",
+            goal="Mission goal",
+            timeout_hours="Hours before the mission expires (optional)",
+        )
+        async def assignagenda(
+            interaction: discord.Interaction,
+            user: discord.User,
+            goal: str,
+            timeout_hours: Optional[float] = None,
+        ):
             await interaction.response.defer(ephemeral=True)
-            ack, dm_message = await self.assistant.assign_agenda(
-                platform="discord",
-                target_user_id=str(user.id),
-                target_username=user.display_name,
-                goal=goal,
-                owner_id=str(interaction.user.id),
+            mission, ack, dm_message = await self.assistant.start_mission(
+                creator_id=f"discord:{interaction.user.id}",
+                target_id=f"discord:{user.id}",
+                objective=goal,
+                timeout_hours=timeout_hours,
+                target_name=user.display_name,
             )
             dm_failed = False
             try:
@@ -46,23 +57,21 @@ class DiscordTransport(commands.Bot):
                 dm_failed = True
                 log.warning("Failed to DM mission to %s: %s", user.id, exc)
             note = " DM delivered." if not dm_failed else " Unable to DM the user."
-            await interaction.followup.send(ack + note, ephemeral=True)
+            await interaction.followup.send(f"{ack}{note}", ephemeral=True)
+            await self._deliver_notifications()
 
         return assignagenda
 
     def _stop_agenda(self) -> app_commands.Command:
-        @app_commands.command(name="stopagenda", description="Stop a user's mission")
-        @app_commands.describe(user="User whose mission should stop")
-        async def stopagenda(
-            interaction: discord.Interaction, user: Optional[discord.User] = None
-        ):
+        @app_commands.command(name="stopagenda", description="Cancel a mission by ID")
+        @app_commands.describe(mission_id="Mission identifier to cancel")
+        async def stopagenda(interaction: discord.Interaction, mission_id: str):
             await interaction.response.defer(ephemeral=True)
-            target = user or interaction.user
-            result = await self.assistant.stop_agenda(
-                platform="discord",
-                target_user_id=str(target.id),
+            result = self.assistant.cancel_mission(
+                creator_id=f"discord:{interaction.user.id}", mission_id=mission_id
             )
             await interaction.followup.send(result, ephemeral=True)
+            await self._deliver_notifications()
 
         return stopagenda
 
@@ -72,25 +81,36 @@ class DiscordTransport(commands.Bot):
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.content:
             return
-        channel_id = message.channel.id
+        channel_id = str(message.channel.id)
         is_dm = message.guild is None
         try:
             result = await self.assistant.handle_message(
                 platform="discord",
                 user_id=str(message.author.id),
-                username=message.author.display_name,
-                channel_id=str(channel_id),
                 message=message.content,
+                username=message.author.display_name,
+                channel_id=channel_id,
                 is_dm=is_dm,
             )
         except Exception as exc:
             log.exception("Assistant error: %s", exc)
-            result = "I can't respond right now."
-        if not result:
-            return
-        reply_text = str(result)
-        if reply_text:
-            await message.channel.send(reply_text, reference=message if not is_dm else None)
+            result = "I'm not available right now."
+        if result:
+            await message.channel.send(result, reference=message if not is_dm else None)
+        await self._deliver_notifications()
+
+    async def _deliver_notifications(self) -> None:
+        notifications = self.assistant.drain_notifications()
+        for note in notifications:
+            if not isinstance(note, Notification):
+                continue
+            if note.platform != "discord":
+                continue
+            try:
+                user_obj = await self.fetch_user(int(note.user_id))
+                await user_obj.send(note.message)
+            except Exception as exc:
+                log.warning("Failed to deliver notification to %s: %s", note.user_id, exc)
 
 
 async def run_discord_bot(assistant, token: str, guild_id: Optional[int] = None):

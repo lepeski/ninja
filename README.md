@@ -6,9 +6,9 @@ Ninja is a shared conversational brain that powers both Discord and Telegram. A 
 
 - **One persona, many rooms** – Discord and Telegram reuse the same assistant instance and memory.
 - **Prompt-driven behavior** – All tone, mission handling, and conversational rules live in the system prompt so replies feel adaptive instead of scripted.
-- **Per-user long-term memory** – Preferences, facts, personality notes, and active missions are stored in SQLite with JSON mirrors in `mem/`.
-- **Context recall** – Each reply considers recent channel history and relevant memories before calling the model.
-- **Missions as goals** – Agenda assignments become conversational objectives that the model pursues naturally rather than step-by-step scripts.
+- **Per-user long-term memory** – Preferences, facts, personality notes, and mission history are stored in SQLite with JSON mirrors in `mem/`.
+- **Context recall** – Each reply considers recent channel history, relevant memories, and mission context before calling the model.
+- **Mission privacy** – Objectives stay hidden from anyone except the creator while the agent still guides targets toward completion.
 - **Trigger handling** – In group chats the bot only answers when messages start with `ninja`; direct messages always receive a response.
 - **Inbox archiving** – First-contact private messages are archived in `mem/inbox/` before the assistant replies.
 
@@ -46,8 +46,10 @@ Start both transports with a single command:
 python main.py
 ```
 
-Discord exposes `/assignagenda <user> <goal>` and `/stopagenda` slash commands (optionally scoped by `DISCORD_GUILD_ID`).
-Telegram offers `/assignagenda <goal>` and `/stopagenda` in DMs only. Each command updates the shared assistant memory so the LLM can pursue missions conversationally.
+Discord exposes `/assignagenda <user> <goal> [timeout_hours]` and `/stopagenda <mission_id>` slash commands (optionally scoped by `DISCORD_GUILD_ID`).
+Telegram offers `/assignagenda <goal> [timeout_hours]` and `/stopagenda <mission_id>` in DMs only. Each command updates the shared assistant memory so the LLM can pursue missions conversationally.
+
+When a mission times out, the assistant automatically notifies the creator via DM with a concise summary. Mission creators can also request snapshots programmatically through `Assistant.get_mission_status("platform:user")`.
 
 ## Data Layout
 
