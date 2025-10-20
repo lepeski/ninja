@@ -43,13 +43,17 @@ class DiscordTransport(commands.Bot):
             timeout_hours: Optional[float] = None,
         ):
             await interaction.response.defer(ephemeral=True)
-            mission, ack, dm_message = await self.assistant.start_mission(
-                creator_id=f"discord:{interaction.user.id}",
-                target_id=f"discord:{user.id}",
-                objective=goal,
-                timeout_hours=timeout_hours,
-                target_name=user.display_name,
-            )
+            try:
+                mission, ack, dm_message = await self.assistant.start_mission(
+                    creator_id=f"discord:{interaction.user.id}",
+                    target_id=f"discord:{user.id}",
+                    objective=goal,
+                    timeout_hours=timeout_hours,
+                    target_name=user.display_name,
+                )
+            except PermissionError as exc:
+                await interaction.followup.send(str(exc), ephemeral=True)
+                return
             dm_failed = False
             try:
                 await user.send(dm_message)

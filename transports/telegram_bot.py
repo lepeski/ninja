@@ -74,13 +74,17 @@ class TelegramTransport:
                 goal = " ".join(context.args[:-1]).strip()
             except ValueError:
                 timeout_arg = None
-        mission, ack, dm_message = await self.assistant.start_mission(
-            creator_id=f"telegram:{user.id}",
-            target_id=f"telegram:{user.id}",
-            objective=goal,
-            timeout_hours=timeout_arg,
-            target_name=user.full_name or user.username or str(user.id),
-        )
+        try:
+            mission, ack, dm_message = await self.assistant.start_mission(
+                creator_id=f"telegram:{user.id}",
+                target_id=f"telegram:{user.id}",
+                objective=goal,
+                timeout_hours=timeout_arg,
+                target_name=user.full_name or user.username or str(user.id),
+            )
+        except PermissionError as exc:
+            await update.effective_message.reply_text(str(exc))
+            return
         await context.bot.send_message(chat_id=user.id, text=dm_message)
         await update.effective_message.reply_text(ack)
         await self._deliver_notifications(context)

@@ -185,6 +185,8 @@ class MemoryStore:
         self, platform: str, user_id: str, key: str, value: str, *, category: str = "notes"
     ) -> None:
         profile = self.recall(platform, user_id)
+        normalized_key = str(key or "").strip().lower()
+        normalized_value = str(value or "").strip()
         if category == "preferences":
             profile.setdefault("preferences", {})[key] = value
         elif category == "facts":
@@ -197,7 +199,42 @@ class MemoryStore:
             notes = profile.setdefault("notes", [])
             notes.append({"key": key, "value": value, "ts": time.time()})
             profile["notes"] = notes[-MEMORY_NOTES_LIMIT:]
+        if normalized_value and normalized_key in {"alias", "name", "callsign", "handle"}:
+            profile["alias"] = normalized_value
         self._save(platform, user_id, profile)
+
+    def is_known(self, platform: str, user_id: str) -> bool:
+        profile = self.recall(platform, user_id)
+        alias = str(profile.get("alias") or "").strip()
+        if alias:
+            return True
+        facts = profile.get("facts") or {}
+        for fact_key, fact_value in facts.items():
+            if str(fact_value or "").strip() and str(fact_key or "").strip().lower() in {
+                "alias",
+                "name",
+                "callsign",
+                "handle",
+            }:
+                profile["alias"] = str(fact_value).strip()
+                self._save(platform, user_id, profile)
+                return True
+        return False
+
+    def display_name(
+        self,
+        platform: str,
+        user_id: str,
+        fallback: Optional[str] = None,
+        *,
+        profile: Optional[dict] = None,
+    ) -> str:
+        profile = profile or self.recall(platform, user_id)
+        alias = str(profile.get("alias") or "").strip()
+        if alias:
+            return alias
+        base = fallback or str(user_id)
+        return f"{base} (?)"
 
     def log_history(self, platform: str, conversation_id: str, role: str, content: str) -> None:
         key = (platform, conversation_id)
@@ -431,11 +468,17 @@ class Assistant:
         self._process_timeouts(platform)
         conversation_id = channel_id or user_id
         profile = self.memory.recall(platform, user_id)
+        display_name = self.memory.display_name(
+            platform,
+            user_id,
+            username or user_id,
+            profile=profile,
+        )
         owner_missions = self.missions.get_active_for_creator(platform, user_id)
         target_missions = self.missions.get_active_for_target(platform, user_id)
         history = self.memory.get_history(platform, conversation_id)
         system_prompt = self._compose_system_prompt(
-            username=username or user_id,
+            username=display_name,
             profile=profile,
             owner_missions=owner_missions,
             target_missions=target_missions,
@@ -462,7 +505,7 @@ class Assistant:
         self._log_mission_exchange(
             platform=platform,
             user_id=user_id,
-            username=username or user_id,
+            username=display_name,
             owner_missions=owner_missions,
             target_missions=target_missions,
             user_message=trimmed,
@@ -471,7 +514,7 @@ class Assistant:
         await self._extract_memories(
             platform=platform,
             user_id=user_id,
-            username=username or user_id,
+            username=display_name,
             last_user=trimmed,
             last_reply=reply,
             profile=profile,
@@ -708,6 +751,10 @@ class Assistant:
         target_platform, target_user_id = self._split_key(target_id)
         if platform != target_platform:
             raise ValueError("Missions must stay on one platform.")
+        if not self.memory.is_known(platform, creator_user_id):
+            raise PermissionError(
+                "identity unknown. share your name or alias before assigning missions."
+            )
         mission = self.missions.create_mission(
             platform=platform,
             creator_user_id=creator_user_id,
@@ -768,6 +815,8 @@ class Assistant:
 
     def get_mission_status(self, creator_id: str) -> str:
         platform, creator_user_id = self._split_key(creator_id)
+        if not self.memory.is_known(platform, creator_user_id):
+            return "Identify yourself before requesting mission intel."
         missions = self.missions.get_for_creator(platform, creator_user_id)
         if not missions:
             return "No missions on record."
@@ -794,6 +843,8 @@ class Assistant:
 
     def cancel_mission(self, creator_id: str, mission_id: str) -> str:
         platform, creator_user_id = self._split_key(creator_id)
+        if not self.memory.is_known(platform, creator_user_id):
+            return "Identify yourself before managing missions."
         mission = self.missions.get_by_id(mission_id)
         if not mission or mission.platform != platform:
             return "Mission not found."

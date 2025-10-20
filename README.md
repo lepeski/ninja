@@ -46,7 +46,7 @@ Start both transports with a single command:
 python main.py
 ```
 
-Discord exposes `/assignagenda <user> <goal> [timeout_hours]` and `/stopagenda <mission_id>` slash commands (optionally scoped by `DISCORD_GUILD_ID`).
+Discord exposes `/assignagenda <user> <goal> [timeout_hours]` and `/stopagenda <mission_id>` slash commands (optionally scoped by `DISCORD_GUILD_ID`). Mission assignment requires the creator to have an established alias or name on record so the assistant can confirm identity.
 Telegram offers `/assignagenda <goal> [timeout_hours]` and `/stopagenda <mission_id>` in DMs only. Each command updates the shared assistant memory so the LLM can pursue missions conversationally.
 
 When a mission times out, the assistant automatically notifies the creator via DM with a concise summary. Mission creators can also request snapshots programmatically through `Assistant.get_mission_status("platform:user")`.
