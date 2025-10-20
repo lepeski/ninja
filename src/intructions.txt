@@ -1,0 +1,47 @@
+## ✅ Setup Guide
+
+1. Navigate to your bot folder (where this file is) and type `cmd` in the folder path bar to open a command window there.
+
+2. In CMD, install dependencies:
+   pip install -r requirements.txt
+
+3. Copy your `.env.example` file and in the copy add:
+   - your Discord bot token
+   - your OpenAI API key
+   - your Discord user ID
+   - the  Discord channel ID's it can auto reply in
+ - then, rename the copied file to just .env
+
+---
+
+## ✅ How to Get Your Tokens
+
+### 1. Get Discord Bot Token
+Go here: https://discord.com/developers/applications
+New Application → name it
+Left side: Bot → Add Bot
+Click Reset Token → copy → this is your DISCORD_TOKEN
+Turn these ON:
+- MESSAGE CONTENT INTENT
+- SERVER MEMBERS INTENT
+Left side: OAuth2 → URL Generator
+Scopes: bot + applications.commands
+Bot Permissions: Send Messages, Read Message History, Use Slash Commands
+Copy the generated link → open it → invite bot to your server
+
+### 2. Get OpenAI API Key
+Go here: https://platform.openai.com/api-keys
+Create new secret key
+Copy → this is your OPENAI_API_KEY
+
+### 3. Get Your Discord User ID
+Discord → Settings → Advanced → enable Developer Mode
+Right-click your profile → Copy User ID
+Paste into `.env` as OWNER_IDS
+
+---
+
+## ✅ 5. Run the Bot
+python bot.py
+
+Then test in Discord with /ping or by mentioning the bot.
