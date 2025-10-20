@@ -16,6 +16,7 @@ MAX_HISTORY = 50
 HISTORY_MAX_CHARS = 8000
 MEMORY_NOTES_LIMIT = 50
 MEMORY_SNIPPET_LIMIT = 10
+UNKNOWN_ALIAS = "nigel inca gang gang adam"
 
 
 @dataclass
@@ -233,8 +234,10 @@ class MemoryStore:
         alias = str(profile.get("alias") or "").strip()
         if alias:
             return alias
-        base = fallback or str(user_id)
-        return f"{base} (?)"
+        candidate = str(fallback or "").strip()
+        if candidate and candidate != str(user_id) and not candidate.isdigit():
+            return candidate
+        return UNKNOWN_ALIAS
 
     def alias_for(
         self,
@@ -247,9 +250,10 @@ class MemoryStore:
         alias = str(profile.get("alias") or "").strip()
         if alias:
             return alias
-        if fallback:
-            return fallback
-        return f"id:{user_id}"
+        candidate = str(fallback or "").strip()
+        if candidate and candidate != str(user_id) and not candidate.isdigit():
+            return candidate
+        return UNKNOWN_ALIAS
 
     def ensure_alias(self, platform: str, user_id: str, alias: Optional[str]) -> None:
         clean = str(alias or "").strip()
@@ -513,6 +517,7 @@ class Assistant:
             owner_missions=owner_missions,
             target_missions=target_missions,
             is_dm=is_dm,
+            user_id=user_id,
         )
         messages_payload = [{"role": "system", "content": system_prompt}]
         for role, content in history:
@@ -564,6 +569,7 @@ class Assistant:
         owner_missions: List[MissionRecord],
         target_missions: List[MissionRecord],
         is_dm: bool,
+        user_id: str,
     ) -> str:
         def shorten(text: str, limit: int = 160) -> str:
             snippet = (text or "").strip()
@@ -580,6 +586,7 @@ class Assistant:
         alias = (profile.get("alias") or "").strip()
         if alias:
             add_memory_bit(f"alias={alias}")
+        add_memory_bit(f"id={profile.get('user_id') or user_id}")
         for key, value in (profile.get("preferences") or {}).items():
             add_memory_bit(f"pref {key}={value}")
         for key, value in (profile.get("facts") or {}).items():
@@ -603,11 +610,11 @@ class Assistant:
             target_alias = self.memory.alias_for(
                 mission.platform,
                 mission.target_user_id,
-                fallback=mission.target_user_id,
+                fallback=None,
             )
             line = (
-                f"{mission.mission_id}[{status}] target={target_alias} :: "
-                f"{shorten(mission.objective)}"
+                f"{mission.mission_id}[{status}] target={target_alias}"
+                f" (id={mission.target_user_id}) :: {shorten(mission.objective)}"
             )
             if mission.log:
                 last = mission.log[-1]
@@ -618,7 +625,15 @@ class Assistant:
 
         target_lines: List[str] = []
         for mission in target_missions[:3]:
-            line = f"{mission.mission_id} {shorten(mission.objective)}"
+            creator_alias = self.memory.alias_for(
+                mission.platform,
+                mission.creator_user_id,
+                fallback=None,
+            )
+            line = (
+                f"{mission.mission_id} creator={creator_alias}"
+                f" (id={mission.creator_user_id}) :: {shorten(mission.objective)}"
+            )
             if mission.log:
                 last = mission.log[-1]
                 text = shorten(str(last.get("text", "")), 60)
@@ -650,6 +665,7 @@ class Assistant:
             "rules: stay brief. no filler. maintain privacy. one clarifying question max. never leak creator intel to targets. once goal met, end it.",
             "identity pressure: first ask redirect; second hint assignment; persistent -> short refusals (\"no.\" / \"irrelevant.\")",
             f"user: {username}",
+            f"user_id: {user_id}",
             f"role: {role_label}",
             f"channel: {'dm' if is_dm else 'group'}",
             "memory: " + " | ".join(memory_bits),
@@ -964,6 +980,11 @@ class Assistant:
         )
         if target_name:
             self.memory.ensure_alias(platform, target_user_id, target_name)
+        target_label = self.memory.alias_for(
+            platform,
+            target_user_id,
+            fallback=target_name,
+        )
         self.memory.remember(
             platform=platform,
             user_id=creator_user_id,
@@ -974,7 +995,7 @@ class Assistant:
         intro = await self._generate_mission_intro(
             platform=platform,
             objective=objective,
-            target_name=target_name or target_user_id,
+            target_name=target_label,
         )
         ack = (
             f"Mission {mission.mission_id} created. Objective logged."
@@ -1036,10 +1057,10 @@ class Assistant:
             target_alias = self.memory.alias_for(
                 mission.platform,
                 mission.target_user_id,
-                fallback=mission.target_user_id,
+                fallback=None,
             )
             lines.append(
-                f"{mission.mission_id}: {status} — target={target_alias} — {mission.objective}"
+                f"{mission.mission_id}: {status} — target={target_alias} (id={mission.target_user_id}) — {mission.objective}"
             )
             if mission.log:
                 recent = mission.log[-2:]
