@@ -18,7 +18,6 @@ async def main():
     discord_token = os.getenv("DISCORD_TOKEN")
     telegram_token = os.getenv("TELEGRAM_TOKEN")
     model = os.getenv("MODEL", "gpt-4.1-mini")
-    embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
     mem_dir = os.getenv("MEM_DIR", "mem")
     guild_id_raw = os.getenv("DISCORD_GUILD_ID")
     guild_id = int(guild_id_raw) if guild_id_raw and guild_id_raw.isdigit() else None
@@ -29,7 +28,6 @@ async def main():
     assistant = Assistant(
         openai_api_key=openai_key,
         model=model,
-        embedding_model=embedding_model,
         mem_dir=mem_dir,
     )
 

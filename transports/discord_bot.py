@@ -5,8 +5,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from core.assistant import AssistantResponse
-
 log = logging.getLogger(__name__)
 
 
@@ -87,25 +85,12 @@ class DiscordTransport(commands.Bot):
             )
         except Exception as exc:
             log.exception("Assistant error: %s", exc)
-            result = AssistantResponse(reply="I can't respond right now.")
+            result = "I can't respond right now."
         if not result:
             return
-        if isinstance(result, AssistantResponse):
-            reply_text = result.reply
-            owner_messages = list(result.owner_messages)
-        else:
-            reply_text = str(result)
-            owner_messages = []
+        reply_text = str(result)
         if reply_text:
             await message.channel.send(reply_text, reference=message if not is_dm else None)
-        for owner_id, text in owner_messages:
-            if not owner_id or not text:
-                continue
-            try:
-                owner_user = await self.fetch_user(int(owner_id))
-                await owner_user.send(text)
-            except Exception as exc:
-                log.warning("Failed to DM mission owner %s: %s", owner_id, exc)
 
 
 async def run_discord_bot(assistant, token: str, guild_id: Optional[int] = None):
