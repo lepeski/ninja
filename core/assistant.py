@@ -5,7 +5,7 @@ import re
 import sqlite3
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
@@ -56,6 +56,13 @@ class Agenda:
     last_dm: float
     created: float
     warned: bool
+    answers: List[Dict[str, str]]
+
+
+@dataclass
+class AssistantResponse:
+    reply: Optional[str] = None
+    owner_messages: List[Tuple[str, str]] = field(default_factory=list)
 
 
 class Memory:
@@ -89,38 +96,45 @@ class Memory:
                   owner_id TEXT NOT NULL DEFAULT '',
                   created REAL NOT NULL DEFAULT 0,
                   warned INTEGER NOT NULL DEFAULT 0,
+                  answers TEXT NOT NULL DEFAULT '[]',
                   PRIMARY KEY(platform, user_id)
                 )
-                """
-            )
+            """
+        )
+        try:
             self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users(
-                  platform TEXT NOT NULL,
-                  user_id TEXT NOT NULL,
-                  alias TEXT DEFAULT '',
-                  profile TEXT DEFAULT '',
-                  profile_updated REAL DEFAULT 0,
-                  PRIMARY KEY(platform, user_id)
-                )
-                """
+                "ALTER TABLE agendas ADD COLUMN answers TEXT NOT NULL DEFAULT '[]'"
             )
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS memories(
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  platform TEXT NOT NULL,
-                  user_id TEXT NOT NULL,
-                  ts REAL NOT NULL,
-                  kind TEXT NOT NULL,
-                  text TEXT NOT NULL,
-                  embedding TEXT NOT NULL
-                )
-                """
+        except sqlite3.OperationalError:
+            pass
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users(
+              platform TEXT NOT NULL,
+              user_id TEXT NOT NULL,
+              alias TEXT DEFAULT '',
+              profile TEXT DEFAULT '',
+              profile_updated REAL DEFAULT 0,
+              PRIMARY KEY(platform, user_id)
             )
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(platform, user_id)"
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memories(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              platform TEXT NOT NULL,
+              user_id TEXT NOT NULL,
+              ts REAL NOT NULL,
+              kind TEXT NOT NULL,
+              text TEXT NOT NULL,
+              embedding TEXT NOT NULL
             )
+            """
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(platform, user_id)"
+        )
 
     def _json_path(self, platform: str, user_id: str) -> Path:
         safe_platform = re.sub(r"[^a-z0-9_-]", "_", platform.lower())
@@ -338,18 +352,20 @@ class Memory:
         with self.conn:
             self.conn.execute(
                 """
-                INSERT INTO agendas(platform, user_id, goal, steps, idx, active, last_dm, owner_id, created, warned)
-                VALUES(?,?,?,?,0,1,0,?, ?, 0)
+                INSERT INTO agendas(platform, user_id, goal, steps, idx, active, last_dm, owner_id, created, warned, answers)
+                VALUES(?,?,?,?,?,1,0,?, ?, 0, ?)
                 ON CONFLICT(platform, user_id)
-                DO UPDATE SET goal=excluded.goal, steps=excluded.steps, idx=0, active=1, last_dm=0, owner_id=excluded.owner_id, created=excluded.created, warned=0
+                DO UPDATE SET goal=excluded.goal, steps=excluded.steps, idx=excluded.idx, active=1, last_dm=0, owner_id=excluded.owner_id, created=excluded.created, warned=0, answers=excluded.answers
                 """,
                 (
                     platform,
                     user_id,
                     goal,
                     json.dumps(list(steps)),
+                    -1,
                     owner_id,
                     time.time(),
+                    json.dumps([], ensure_ascii=False),
                 ),
             )
 
@@ -373,6 +389,11 @@ class Memory:
             steps = json.loads(row["steps"]) or []
         except Exception:
             steps = []
+        answers: List[Dict[str, str]] = []
+        try:
+            answers = json.loads(row["answers"]) if row["answers"] else []
+        except Exception:
+            answers = []
         return Agenda(
             goal=row["goal"],
             steps=list(steps),
@@ -382,16 +403,39 @@ class Memory:
             last_dm=float(row["last_dm"] or 0.0),
             created=float(row["created"] or 0.0),
             warned=bool(row["warned"]),
+            answers=list(answers),
         )
 
-    def update_agenda_progress(
-        self, platform: str, user_id: str, idx: int, warned: bool = False
+    def update_agenda_state(
+        self,
+        platform: str,
+        user_id: str,
+        *,
+        idx: Optional[int] = None,
+        warned: Optional[bool] = None,
+        active: Optional[bool] = None,
+        answers: Optional[Sequence[Dict[str, str]]] = None,
     ):
+        fields = []
+        params: List = []
+        if idx is not None:
+            fields.append("idx=?")
+            params.append(idx)
+        if warned is not None:
+            fields.append("warned=?")
+            params.append(int(warned))
+        if active is not None:
+            fields.append("active=?")
+            params.append(int(active))
+        if answers is not None:
+            fields.append("answers=?")
+            params.append(json.dumps(list(answers), ensure_ascii=False))
+        fields.append("last_dm=?")
+        params.append(time.time())
+        sql = f"UPDATE agendas SET {', '.join(fields)} WHERE platform=? AND user_id=?"
+        params.extend([platform, user_id])
         with self.conn:
-            self.conn.execute(
-                "UPDATE agendas SET idx=?, warned=?, last_dm=? WHERE platform=? AND user_id=?",
-                (idx, int(warned), time.time(), platform, user_id),
-            )
+            self.conn.execute(sql, params)
 
 
 class Assistant:
@@ -436,7 +480,7 @@ class Assistant:
         channel_id: str,
         message: str,
         is_dm: bool,
-    ) -> Optional[str]:
+    ) -> Optional[AssistantResponse]:
         should_reply, content = self._should_reply(message, is_dm)
         if not should_reply:
             return None
@@ -457,15 +501,39 @@ class Assistant:
 
         agenda = self.memory.get_agenda(platform, user_id) if is_dm else None
 
+        if agenda and agenda.active:
+            mission_result = await self._handle_agenda_dm(
+                platform=platform,
+                user_id=user_id,
+                username=username,
+                message=norm_content,
+                agenda=agenda,
+            )
+            if mission_result:
+                if mission_result.reply and not known_alias:
+                    mission_result.reply = f"{mission_result.reply} {UNKNOWN_SUFFIX}".strip()
+                if mission_result.reply:
+                    self.memory.add_short(platform, channel_id, "assistant", mission_result.reply)
+                    self.memory.append_history(platform, user_id, "assistant", mission_result.reply)
+                return mission_result
+
         special = self._detect_special(norm_content)
         if special:
-            return await self._handle_special(
+            special_result = await self._handle_special(
                 special,
                 platform=platform,
                 user_id=user_id,
                 username=username,
                 agenda=agenda,
             )
+            reply_text = special_result
+            if reply_text and not known_alias:
+                reply_text = f"{reply_text} {UNKNOWN_SUFFIX}".strip()
+            if reply_text:
+                self.memory.add_short(platform, channel_id, "assistant", reply_text)
+                self.memory.append_history(platform, user_id, "assistant", reply_text)
+                return AssistantResponse(reply=reply_text)
+            return None
 
         embed = await self._embed_text(norm_content)
         recalls = []
@@ -492,21 +560,18 @@ class Assistant:
             response = await self._chat(messages)
         except Exception as exc:
             log.exception("chat failure: %s", exc)
-            return "I can't respond right now." + (
-                f" {UNKNOWN_SUFFIX}" if not self.memory.get_alias(platform, user_id) else ""
-            )
+            fallback = "I can't respond right now."
+            if not known_alias:
+                fallback = f"{fallback} {UNKNOWN_SUFFIX}".strip()
+            return AssistantResponse(reply=fallback)
 
         self.memory.add_short(platform, channel_id, "assistant", response)
         self.memory.append_history(platform, user_id, "assistant", response)
 
-        if agenda and agenda.active:
-            idx = min(agenda.idx + 1, len(agenda.steps))
-            self.memory.update_agenda_progress(platform, user_id, idx)
-
         if not known_alias:
             response = f"{response} {UNKNOWN_SUFFIX}".strip()
 
-        return response
+        return AssistantResponse(reply=response)
 
     def _detect_special(self, text: str) -> Optional[str]:
         norm = self._normalize(text)
@@ -536,6 +601,269 @@ class Assistant:
                 return f"I have recorded that you value {', '.join(facts)}."
             return "I don't have any preferences saved yet."
         return "I don't have that information."
+
+    async def _handle_agenda_dm(
+        self,
+        *,
+        platform: str,
+        user_id: str,
+        username: str,
+        message: str,
+        agenda: Agenda,
+    ) -> Optional[AssistantResponse]:
+        text = message.strip()
+        lowered = text.lower()
+        tokens = set(re.findall(r"[a-z']+", lowered))
+
+        yes_tokens = {
+            "yes",
+            "y",
+            "ready",
+            "ok",
+            "okay",
+            "sure",
+            "alright",
+            "fine",
+            "start",
+            "go",
+            "aye",
+            "yep",
+            "yah",
+            "ya",
+        }
+        stop_tokens = {
+            "stop",
+            "no",
+            "nah",
+            "nope",
+            "cancel",
+            "leave",
+            "quit",
+            "bye",
+        }
+        vague_phrases = [
+            "idk",
+            "i don't know",
+            "dont know",
+            "not sure",
+            "no idea",
+            "maybe",
+        ]
+        ready_phrases = ["let's go", "lets go", "i am ready", "im ready"]
+        stop_phrases = ["leave me alone", "go away", "stop this", "not interested"]
+
+        def has_phrase(phrases: Sequence[str]) -> bool:
+            return any(phrase in lowered for phrase in phrases)
+
+        def is_positive() -> bool:
+            return bool(tokens & yes_tokens) or has_phrase(ready_phrases)
+
+        def is_stop() -> bool:
+            return bool(tokens & stop_tokens) or has_phrase(stop_phrases)
+
+        def is_probe() -> bool:
+            return "who sent" in lowered or (
+                "who" in tokens and "sent" in tokens and "you" in tokens
+            ) or "what is this" in lowered
+
+        def is_confused() -> bool:
+            stripped = lowered.strip(" ?!.")
+            return (
+                not text
+                or stripped in {"?", "??", "???", "what", "huh", "who"}
+                or "?" in lowered
+            )
+
+        def is_vague() -> bool:
+            return has_phrase(vague_phrases) or len(text) < 2
+
+        def agenda_prompt(step_text: str, idx: int) -> str:
+            step_text = step_text.strip()
+            if idx == 0:
+                return f"goal: {agenda.goal}. focus. {step_text}"
+            return f"focus. {step_text}"
+
+        def remind_step(step_text: str) -> str:
+            return f"answer plainly. {step_text.strip()}"
+
+        def refuse_response() -> AssistantResponse:
+            if not agenda.warned:
+                self.memory.update_agenda_state(
+                    platform,
+                    user_id,
+                    idx=agenda.idx,
+                    warned=True,
+                )
+                return AssistantResponse(reply="steady. if you want out, say stop again.")
+            owner_msgs: List[Tuple[str, str]] = []
+            if agenda.owner_id:
+                owner_msgs.append(
+                    (
+                        agenda.owner_id,
+                        f"{username} refused the mission '{agenda.goal}'.",
+                    )
+                )
+            self.memory.update_agenda_state(
+                platform,
+                user_id,
+                idx=agenda.idx,
+                warned=False,
+                active=False,
+                answers=agenda.answers,
+            )
+            return AssistantResponse(reply="understood. I withdraw.", owner_messages=owner_msgs)
+
+        if agenda.idx < 0:
+            if is_stop():
+                return refuse_response()
+            if is_positive():
+                if not agenda.steps:
+                    owner_msgs: List[Tuple[str, str]] = []
+                    if agenda.owner_id:
+                        owner_msgs.append(
+                            (
+                                agenda.owner_id,
+                                f"{username} accepted, but no steps exist for '{agenda.goal}'.",
+                            )
+                        )
+                    self.memory.update_agenda_state(
+                        platform,
+                        user_id,
+                        idx=0,
+                        warned=False,
+                        active=False,
+                        answers=agenda.answers,
+                    )
+                    return AssistantResponse(
+                        reply="ready, but no mission steps were set.",
+                        owner_messages=owner_msgs,
+                    )
+                prompt = agenda_prompt(agenda.steps[0], 0)
+                self.memory.update_agenda_state(
+                    platform,
+                    user_id,
+                    idx=0,
+                    warned=False,
+                    answers=agenda.answers,
+                )
+                return AssistantResponse(reply=prompt)
+            if is_probe():
+                self.memory.update_agenda_state(
+                    platform,
+                    user_id,
+                    idx=agenda.idx,
+                    warned=agenda.warned,
+                )
+                return AssistantResponse(reply="allies in the shadows. answer plainly.")
+            if is_confused() or is_vague():
+                self.memory.update_agenda_state(
+                    platform,
+                    user_id,
+                    idx=agenda.idx,
+                    warned=agenda.warned,
+                )
+                return AssistantResponse(reply="I asked if you're ready. answer plainly.")
+            self.memory.update_agenda_state(
+                platform,
+                user_id,
+                idx=agenda.idx,
+                warned=agenda.warned,
+            )
+            return AssistantResponse(reply="say ready when you are.")
+
+        if is_stop():
+            return refuse_response()
+
+        if agenda.idx >= len(agenda.steps):
+            self.memory.update_agenda_state(
+                platform,
+                user_id,
+                idx=agenda.idx,
+                warned=False,
+                active=False,
+                answers=agenda.answers,
+            )
+            return AssistantResponse(reply="mission already closed.")
+
+        current_step = agenda.steps[agenda.idx]
+        if is_probe():
+            self.memory.update_agenda_state(
+                platform,
+                user_id,
+                idx=agenda.idx,
+                warned=agenda.warned,
+            )
+            return AssistantResponse(reply="friends sent me. stay on task.")
+        if is_confused():
+            self.memory.update_agenda_state(
+                platform,
+                user_id,
+                idx=agenda.idx,
+                warned=agenda.warned,
+            )
+            return AssistantResponse(reply=f"I asked: {current_step.strip()}")
+        if is_vague():
+            self.memory.update_agenda_state(
+                platform,
+                user_id,
+                idx=agenda.idx,
+                warned=agenda.warned,
+            )
+            return AssistantResponse(reply=remind_step(current_step))
+
+        answers = list(agenda.answers)
+        answers.append({"step": current_step, "answer": text})
+        next_idx = agenda.idx + 1
+        if next_idx >= len(agenda.steps):
+            self.memory.update_agenda_state(
+                platform,
+                user_id,
+                idx=next_idx,
+                warned=False,
+                active=False,
+                answers=answers,
+            )
+            summary = self._format_agenda_summary(username, agenda.goal, answers)
+            owner_msgs: List[Tuple[str, str]] = []
+            if agenda.owner_id:
+                owner_msgs.append((agenda.owner_id, summary))
+            await self._store_mission_memory(platform, user_id, summary)
+            return AssistantResponse(
+                reply="mission complete. I'll brief them.", owner_messages=owner_msgs
+            )
+
+        next_step = agenda.steps[next_idx]
+        self.memory.update_agenda_state(
+            platform,
+            user_id,
+            idx=next_idx,
+            warned=False,
+            answers=answers,
+        )
+        return AssistantResponse(reply=f"understood. {agenda_prompt(next_step, next_idx)}")
+
+    def _format_agenda_summary(
+        self, username: str, goal: str, answers: Sequence[Dict[str, str]]
+    ) -> str:
+        fragments = []
+        for idx, item in enumerate(answers):
+            step = (item.get("step") or "").strip()
+            answer = (item.get("answer") or "").strip()
+            if step:
+                fragments.append(f"{idx + 1}: {step} -> {answer}")
+            else:
+                fragments.append(f"{idx + 1}: {answer}")
+        joined = " | ".join(fragments)
+        return f"Report on {username}: {goal}. {joined}".strip()
+
+    async def _store_mission_memory(
+        self, platform: str, user_id: str, summary: str
+    ) -> None:
+        if not summary:
+            return
+        embed = await self._embed_text(summary)
+        if embed:
+            self.memory.store_memory(platform, user_id, "mission", summary, embed)
 
     def _maybe_extract_facts(
         self,
@@ -686,16 +1014,7 @@ class Assistant:
         if not steps:
             steps = ["Take one specific action toward the goal today."]
         self.memory.set_agenda(platform, target_user_id, goal, steps, owner_id)
-        step_lines = [f"{idx + 1}. {step}" for idx, step in enumerate(steps)]
-        dm_message = "\n".join(
-            [
-                f"Mission assigned: {goal}",
-                "",
-                *step_lines,
-                "",
-                "Check in here when you make progress.",
-            ]
-        ).strip()
+        dm_message = "my brothers sent me. ready?"
         ack = f"Mission set for {target_username}."
         return ack, dm_message
 

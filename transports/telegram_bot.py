@@ -11,6 +11,8 @@ from telegram.ext import (
     filters,
 )
 
+from core.assistant import AssistantResponse
+
 log = logging.getLogger(__name__)
 
 
@@ -36,7 +38,7 @@ class TelegramTransport:
             return
         is_dm = chat.type == ChatType.PRIVATE
         try:
-            reply = await self.assistant.handle_message(
+            result = await self.assistant.handle_message(
                 platform="telegram",
                 user_id=str(user.id),
                 username=user.full_name or user.username or str(user.id),
@@ -46,9 +48,24 @@ class TelegramTransport:
             )
         except Exception as exc:
             log.exception("Assistant error: %s", exc)
-            reply = "I can't respond right now."
-        if reply:
-            await message.reply_text(reply)
+            result = AssistantResponse(reply="I can't respond right now.")
+        if not result:
+            return
+        if isinstance(result, AssistantResponse):
+            reply_text = result.reply
+            owner_messages = list(result.owner_messages)
+        else:
+            reply_text = str(result)
+            owner_messages = []
+        if reply_text:
+            await message.reply_text(reply_text)
+        for owner_id, text in owner_messages:
+            if not owner_id or not text:
+                continue
+            try:
+                await context.bot.send_message(chat_id=int(owner_id), text=text)
+            except Exception as exc:
+                log.warning("Failed to DM mission owner %s: %s", owner_id, exc)
 
     async def assign_agenda(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = update.effective_chat
