@@ -236,6 +236,31 @@ class MemoryStore:
         base = fallback or str(user_id)
         return f"{base} (?)"
 
+    def alias_for(
+        self,
+        platform: str,
+        user_id: str,
+        *,
+        fallback: Optional[str] = None,
+    ) -> str:
+        profile = self.recall(platform, user_id)
+        alias = str(profile.get("alias") or "").strip()
+        if alias:
+            return alias
+        if fallback:
+            return fallback
+        return f"id:{user_id}"
+
+    def ensure_alias(self, platform: str, user_id: str, alias: Optional[str]) -> None:
+        clean = str(alias or "").strip()
+        if not clean:
+            return
+        profile = self.recall(platform, user_id)
+        if str(profile.get("alias") or "").strip() == clean:
+            return
+        profile["alias"] = clean
+        self._save(platform, user_id, profile)
+
     def log_history(self, platform: str, conversation_id: str, role: str, content: str) -> None:
         key = (platform, conversation_id)
         history = self._history[key]
@@ -570,7 +595,15 @@ class Assistant:
             if mission.status == "active" and mission.timeout:
                 remaining = max(0.0, mission.timeout - now)
                 status = f"active~{remaining/3600:.1f}h"
-            line = f"{mission.mission_id}[{status}] {shorten(mission.objective)}"
+            target_alias = self.memory.alias_for(
+                mission.platform,
+                mission.target_user_id,
+                fallback=mission.target_user_id,
+            )
+            line = (
+                f"{mission.mission_id}[{status}] target={target_alias} :: "
+                f"{shorten(mission.objective)}"
+            )
             if mission.log:
                 last = mission.log[-1]
                 actor = last.get("actor", "log")
@@ -638,10 +671,11 @@ class Assistant:
         user_message: str,
         assistant_reply: str,
     ) -> None:
+        user_tag = f"{username}|{user_id}"
         for mission in owner_missions:
             self.missions.append_log(
                 mission.mission_id,
-                actor=f"owner:{username}",
+                actor=f"creator:{user_tag}",
                 content=user_message,
             )
             if assistant_reply:
@@ -653,7 +687,7 @@ class Assistant:
         for mission in target_missions:
             self.missions.append_log(
                 mission.mission_id,
-                actor=f"target:{username}",
+                actor=f"target:{user_tag}",
                 content=user_message,
             )
             if assistant_reply:
@@ -920,6 +954,8 @@ class Assistant:
             objective=objective,
             timeout_hours=timeout_hours,
         )
+        if target_name:
+            self.memory.ensure_alias(platform, target_user_id, target_name)
         self.memory.remember(
             platform=platform,
             user_id=creator_user_id,
@@ -989,8 +1025,13 @@ class Assistant:
             if status == "active" and remaining is not None:
                 hours_left = remaining / 3600
                 status = f"active (~{hours_left:.1f}h left)"
+            target_alias = self.memory.alias_for(
+                mission.platform,
+                mission.target_user_id,
+                fallback=mission.target_user_id,
+            )
             lines.append(
-                f"{mission.mission_id}: {status} — {mission.objective}"
+                f"{mission.mission_id}: {status} — target={target_alias} — {mission.objective}"
             )
             if mission.log:
                 recent = mission.log[-2:]
