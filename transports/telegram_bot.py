@@ -80,6 +80,7 @@ class TelegramTransport:
                 target_id=f"telegram:{user.id}",
                 objective=goal,
                 timeout_hours=timeout_arg,
+                creator_name=user.full_name or user.username or str(user.id),
                 target_name=user.full_name or user.username or str(user.id),
             )
         except PermissionError as exc:

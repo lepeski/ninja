@@ -35,7 +35,7 @@ pip install -r requirements.txt
    - `OPENAI_API_KEY`
    - `DISCORD_TOKEN`
    - `TELEGRAM_TOKEN`
-   - Optional overrides: `MODEL`, `MEM_DIR`, `DISCORD_GUILD_ID`
+   - Optional overrides: `MODEL` (defaults to `gpt-4.1`), `MEM_DIR`, `DISCORD_GUILD_ID`
 3. Ensure the `mem/` directory remains writable (it is created automatically on first run).
 
 ## Running
@@ -46,7 +46,7 @@ Start both transports with a single command:
 python main.py
 ```
 
-Discord exposes `/assignagenda <user> <goal> [timeout_hours]` and `/stopagenda <mission_id>` slash commands (optionally scoped by `DISCORD_GUILD_ID`). Mission assignment requires the creator to have an established alias or name on record so the assistant can confirm identity.
+Discord exposes `/assignagenda <user> <goal> [timeout_hours]` and `/stopagenda <mission_id>` slash commands (optionally scoped by `DISCORD_GUILD_ID`). Mission assignment requires the creator to have an established alias or name on record so the assistant can confirm identity; the bot now records display names automatically to keep trusted contacts recognized.
 Telegram offers `/assignagenda <goal> [timeout_hours]` and `/stopagenda <mission_id>` in DMs only. Each command updates the shared assistant memory so the LLM can pursue missions conversationally.
 
 When a mission times out, the assistant automatically notifies the creator via DM with a concise summary. Mission creators can also request snapshots programmatically through `Assistant.get_mission_status("platform:user")`.

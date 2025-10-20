@@ -49,6 +49,7 @@ class DiscordTransport(commands.Bot):
                     target_id=f"discord:{user.id}",
                     objective=goal,
                     timeout_hours=timeout_hours,
+                    creator_name=interaction.user.display_name,
                     target_name=user.display_name,
                 )
             except PermissionError as exc:

@@ -466,7 +466,10 @@ class Assistant:
         self._pending_notifications: List[Notification] = []
 
     def _build_persona_prompt(self) -> str:
-        return "ninja speaks in lowercase fragments. concise, calm, direct. only useful info."
+        return (
+            "ninja operates in lowercase fragments. concise, calm, direct."
+            " use context, missions, and memory intelligently. only useful info."
+        )
 
     async def close(self) -> None:
         await self.client.close()
@@ -492,6 +495,8 @@ class Assistant:
             )
         self._process_timeouts(platform)
         conversation_id = channel_id or user_id
+        if username:
+            self.memory.ensure_alias(platform, user_id, username)
         profile = self.memory.recall(platform, user_id)
         display_name = self.memory.display_name(
             platform,
@@ -938,11 +943,14 @@ class Assistant:
         timeout_hours: Optional[float],
         *,
         target_name: Optional[str] = None,
+        creator_name: Optional[str] = None,
     ) -> Tuple[MissionRecord, str, str]:
         platform, creator_user_id = self._split_key(creator_id)
         target_platform, target_user_id = self._split_key(target_id)
         if platform != target_platform:
             raise ValueError("Missions must stay on one platform.")
+        if creator_name:
+            self.memory.ensure_alias(platform, creator_user_id, creator_name)
         if not self.memory.is_known(platform, creator_user_id):
             raise PermissionError(
                 "identity unknown. share your name or alias before assigning missions."
