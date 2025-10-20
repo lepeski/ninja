@@ -46,7 +46,7 @@ class TelegramTransport:
             )
         except Exception as exc:
             log.exception("Assistant error: %s", exc)
-            reply = "My words are lost on the wind."
+            reply = "I can't respond right now."
         if reply:
             await message.reply_text(reply)
 
@@ -61,14 +61,15 @@ class TelegramTransport:
         if not goal:
             await update.effective_message.reply_text("Share the mission goal after /assignagenda.")
             return
-        result = await self.assistant.assign_agenda(
+        ack, dm_message = await self.assistant.assign_agenda(
             platform="telegram",
             target_user_id=str(user.id),
             target_username=user.full_name or user.username or str(user.id),
             goal=goal,
             owner_id=str(user.id),
         )
-        await update.effective_message.reply_text(result)
+        await context.bot.send_message(chat_id=user.id, text=dm_message)
+        await update.effective_message.reply_text(ack)
 
     async def stop_agenda(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = update.effective_chat

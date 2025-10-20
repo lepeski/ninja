@@ -19,7 +19,6 @@ async def main():
     telegram_token = os.getenv("TELEGRAM_TOKEN")
     model = os.getenv("MODEL", "gpt-4.1-mini")
     embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-    passive = float(os.getenv("PASSIVE_TRIGGER_CHANCE", "0.05"))
     mem_dir = os.getenv("MEM_DIR", "mem")
     guild_id_raw = os.getenv("DISCORD_GUILD_ID")
     guild_id = int(guild_id_raw) if guild_id_raw and guild_id_raw.isdigit() else None
@@ -31,7 +30,6 @@ async def main():
         openai_api_key=openai_key,
         model=model,
         embedding_model=embedding_model,
-        passive_chance=passive,
         mem_dir=mem_dir,
     )
 

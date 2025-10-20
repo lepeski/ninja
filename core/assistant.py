@@ -1,7 +1,6 @@
 import json
 import logging
 import math
-import random
 import re
 import sqlite3
 import time
@@ -15,8 +14,8 @@ from openai import AsyncOpenAI
 log = logging.getLogger(__name__)
 
 
-STORE_MIN_LEN = 6
-STORE_COOLDOWN_S = 60
+STORE_MIN_LEN = 18
+STORE_COOLDOWN_S = 5 * 60
 RECALL_TOPK = 5
 RECALL_MAX_CHARS = 600
 EMBED_TRUNCATE = 800
@@ -68,9 +67,12 @@ class Memory:
         )
         self.mem_dir = mem_dir
         self.mem_dir.mkdir(parents=True, exist_ok=True)
+        self.inbox_dir = self.mem_dir / "inbox"
+        self.inbox_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
         self._last_store: Dict[Tuple[str, str], float] = {}
         self._last_profile: Dict[Tuple[str, str], float] = {}
+        self._last_text: Dict[Tuple[str, str], str] = {}
 
     def _init_db(self):
         with self.conn:
@@ -302,6 +304,29 @@ class Memory:
     def set_last_profile(self, platform: str, user_id: str):
         self._last_profile[(platform, user_id)] = time.time()
 
+    def get_last_text(self, platform: str, user_id: str) -> str:
+        return self._last_text.get((platform, user_id), "")
+
+    def set_last_text(self, platform: str, user_id: str, text: str):
+        self._last_text[(platform, user_id)] = text
+
+    def has_assistant_reply(self, platform: str, user_id: str) -> bool:
+        data = self._load_json(platform, user_id)
+        return any(item.get("role") == "assistant" for item in data.get("history", []))
+
+    def log_unsolicited_dm(self, platform: str, user_id: str, text: str):
+        safe_platform = re.sub(r"[^a-z0-9_-]", "_", platform.lower())
+        safe_user = re.sub(r"[^a-z0-9_-]", "_", str(user_id))
+        path = self.inbox_dir / f"{safe_platform}_{safe_user}.log"
+        entry = {
+            "ts": time.time(),
+            "platform": platform,
+            "user_id": user_id,
+            "text": text,
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
     def set_agenda(
         self,
         platform: str,
@@ -376,14 +401,12 @@ class Assistant:
         openai_api_key: str,
         model: str,
         embedding_model: str,
-        passive_chance: float = 0.05,
         mem_dir: str = "mem",
         memory_db: str = "memory.db",
     ):
         self.client = AsyncOpenAI(api_key=openai_api_key)
         self.model = model
         self.embedding_model = embedding_model
-        self.passive_chance = passive_chance
         self.memory = Memory(db_path=memory_db, mem_dir=Path(mem_dir))
     async def close(self):
         pass
@@ -423,6 +446,9 @@ class Assistant:
         norm_content = content.strip()
         if not norm_content:
             return None
+
+        if is_dm and not self.memory.has_assistant_reply(platform, user_id):
+            self.memory.log_unsolicited_dm(platform, user_id, norm_content)
 
         known_alias = self.memory.get_alias(platform, user_id)
         self.memory.set_alias(platform, user_id, username)
@@ -466,28 +492,16 @@ class Assistant:
             response = await self._chat(messages)
         except Exception as exc:
             log.exception("chat failure: %s", exc)
-            return "The winds falter; I cannot speak right now." + (
+            return "I can't respond right now." + (
                 f" {UNKNOWN_SUFFIX}" if not self.memory.get_alias(platform, user_id) else ""
             )
 
         self.memory.add_short(platform, channel_id, "assistant", response)
         self.memory.append_history(platform, user_id, "assistant", response)
 
-        if embed:
-            await self._maybe_store_memory(
-                platform,
-                user_id,
-                kind="response",
-                text=response,
-                embedding=await self._embed_text(response),
-            )
-
         if agenda and agenda.active:
             idx = min(agenda.idx + 1, len(agenda.steps))
             self.memory.update_agenda_progress(platform, user_id, idx)
-
-        if random.random() < self.passive_chance:
-            response += "\nThe bamboo rustles with quiet judgments."
 
         if not known_alias:
             response = f"{response} {UNKNOWN_SUFFIX}".strip()
@@ -515,22 +529,13 @@ class Assistant:
         facts = profile.get("facts", [])
         if special == "whoami":
             if facts:
-                return (
-                    f"You stand as {alias}, known for {', '.join(facts)}."
-                    f" Remain balanced, warrior."
-                )
-            return f"You are {alias}, a traveler whose path is still being traced."
+                return f"You are {alias}. I remember {', '.join(facts)}."
+            return f"You are {alias}. I don't have more notes yet."
         if special == "what_like":
             if facts:
-                return (
-                    f"I recall {alias} cherishes {', '.join(facts)}."
-                    " That is how the tale is written."
-                )
-            return (
-                "My scrolls hold little ink about your tastes."
-                " Share more, and the memory will blossom."
-            )
-        return "The scroll is blank; I cannot answer."
+                return f"I have recorded that you value {', '.join(facts)}."
+            return "I don't have any preferences saved yet."
+        return "I don't have that information."
 
     def _maybe_extract_facts(
         self,
@@ -573,8 +578,11 @@ class Assistant:
         last = self.memory.get_last_store(platform, user_id)
         if time.time() - last < STORE_COOLDOWN_S:
             return
+        if text == self.memory.get_last_text(platform, user_id):
+            return
         self.memory.store_memory(platform, user_id, kind, text, embedding)
         self.memory.set_last_store(platform, user_id)
+        self.memory.set_last_text(platform, user_id, text)
 
     def _build_prompt(
         self,
@@ -607,10 +615,10 @@ class Assistant:
         summary = "\n".join(summary_lines).strip()
 
         persona = (
-            "You are Ninja, a calm samurai assistant speaking in short,"
-            " poetic lines. You remember users and respect their privacy."
-            " When guiding agendas, stay supportive and mission-focused."
-            " Offer gentle passive opinions only when natural."
+            "You are Ninja, a concise strategist."
+            " Speak in brief, direct sentences with a steady tone."
+            " Avoid metaphors and flowery language."
+            " Keep responses focused on the user's needs."
         )
         prompt = (
             f"Persona: {persona}\n"
@@ -620,7 +628,7 @@ class Assistant:
         )
         if summary:
             prompt += f"Known data:\n{summary}\n"
-        prompt += "Respond with humility and precision."
+        prompt += "Respond briefly and clearly."
         return prompt
 
     def _format_messages(
@@ -670,18 +678,26 @@ class Assistant:
         target_username: str,
         goal: str,
         owner_id: str,
-    ) -> str:
+    ) -> Tuple[str, str]:
         platform = platform.lower()
         target_user_id = str(target_user_id)
         owner_id = str(owner_id)
         steps = await self._generate_agenda_steps(goal)
         if not steps:
-            steps = ["Reflect on the mission and take the first mindful step."]
+            steps = ["Take one specific action toward the goal today."]
         self.memory.set_agenda(platform, target_user_id, goal, steps, owner_id)
-        return (
-            f"Agenda shaped for {target_username}: {goal}."
-            " The steps await them in private whispers."
-        )
+        step_lines = [f"{idx + 1}. {step}" for idx, step in enumerate(steps)]
+        dm_message = "\n".join(
+            [
+                f"Mission assigned: {goal}",
+                "",
+                *step_lines,
+                "",
+                "Check in here when you make progress.",
+            ]
+        ).strip()
+        ack = f"Mission set for {target_username}."
+        return ack, dm_message
 
     async def stop_agenda(
         self,
@@ -692,7 +708,7 @@ class Assistant:
         platform = platform.lower()
         target_user_id = str(target_user_id)
         self.memory.clear_agenda(platform, target_user_id)
-        return "The mission scroll is rolled and set aside."
+        return "Agenda cleared."
 
     async def _generate_agenda_steps(self, goal: str) -> List[str]:
         prompt = (

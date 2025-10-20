@@ -32,14 +32,21 @@ class DiscordTransport(commands.Bot):
         @app_commands.describe(user="Target user", goal="Mission goal")
         async def assignagenda(interaction: discord.Interaction, user: discord.User, goal: str):
             await interaction.response.defer(ephemeral=True)
-            result = await self.assistant.assign_agenda(
+            ack, dm_message = await self.assistant.assign_agenda(
                 platform="discord",
                 target_user_id=str(user.id),
                 target_username=user.display_name,
                 goal=goal,
                 owner_id=str(interaction.user.id),
             )
-            await interaction.followup.send(result, ephemeral=True)
+            dm_failed = False
+            try:
+                await user.send(dm_message)
+            except Exception as exc:
+                dm_failed = True
+                log.warning("Failed to DM mission to %s: %s", user.id, exc)
+            note = " DM delivered." if not dm_failed else " Unable to DM the user."
+            await interaction.followup.send(ack + note, ephemeral=True)
 
         return assignagenda
 
@@ -78,7 +85,7 @@ class DiscordTransport(commands.Bot):
             )
         except Exception as exc:
             log.exception("Assistant error: %s", exc)
-            reply = "My blade wavers; I cannot answer."
+            reply = "I can't respond right now."
         if reply:
             await message.channel.send(reply, reference=message if not is_dm else None)
 
