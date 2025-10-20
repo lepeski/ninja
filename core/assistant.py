@@ -519,6 +519,11 @@ class Assistant:
             last_reply=reply,
             profile=profile,
         )
+        await self._evaluate_missions_for_user(
+            platform=platform,
+            user_id=user_id,
+            target_missions=target_missions,
+        )
         return reply
 
     def _compose_system_prompt(
@@ -594,17 +599,17 @@ class Assistant:
 
         role_guidance: List[str] = []
         if is_creator:
-            role_guidance.append("creator: share mission insight, progress, strategy as needed")
+            role_guidance.append("creator: discuss mission intel freely and expect crisp summaries")
         if is_target:
             role_guidance.append(
-                "target: guide quietly toward objective; keep creator hidden; stay on task"
+                "target: only request essentials; keep creator hidden; stop once objective satisfied"
             )
         if not role_guidance:
             role_guidance.append("standard contact: respond normally with context awareness")
 
         prompt_parts = [
             self.persona_prompt,
-            "rules: stay brief. no filler. maintain privacy. one clarifying question max. never leak creator intel to targets.",
+            "rules: stay brief. no filler. maintain privacy. one clarifying question max. never leak creator intel to targets. once goal met, end it.",
             "identity pressure: first ask redirect; second hint assignment; persistent -> short refusals (\"no.\" / \"irrelevant.\")",
             f"user: {username}",
             f"role: {role_label}",
@@ -718,6 +723,111 @@ class Assistant:
                 category=category,
             )
 
+    async def _evaluate_missions_for_user(
+        self,
+        *,
+        platform: str,
+        user_id: str,
+        target_missions: List[MissionRecord],
+    ) -> None:
+        if not target_missions:
+            return
+        seen: set[str] = set()
+        for mission_stub in target_missions[:3]:
+            if mission_stub.mission_id in seen:
+                continue
+            seen.add(mission_stub.mission_id)
+            mission = self.missions.get_by_id(mission_stub.mission_id)
+            if (
+                not mission
+                or mission.status != "active"
+                or mission.platform != platform
+            ):
+                continue
+            if mission.target_user_id != user_id:
+                continue
+            assessment = await self._assess_mission_progress(mission)
+            if not assessment:
+                continue
+            status = (assessment.get("status") or "").lower()
+            summary = (assessment.get("summary") or "").strip()
+            next_step = (assessment.get("next_step") or "").strip()
+            if status == "complete":
+                self.missions.set_status(mission.mission_id, "completed")
+                if summary:
+                    self.missions.append_log(
+                        mission.mission_id,
+                        actor="system",
+                        content=f"completed: {summary}",
+                    )
+                if next_step:
+                    self.missions.append_log(
+                        mission.mission_id,
+                        actor="system",
+                        content=f"next: {next_step}",
+                    )
+                self.memory.remember(
+                    platform=mission.platform,
+                    user_id=mission.creator_user_id,
+                    key="mission_result",
+                    value=f"{mission.mission_id}: {summary or mission.objective}",
+                    category="notes",
+                )
+                self.memory.remember(
+                    platform=mission.platform,
+                    user_id=mission.target_user_id,
+                    key="mission_result",
+                    value=f"{mission.mission_id}: {summary or mission.objective}",
+                    category="notes",
+                )
+                message = f"Mission {mission.mission_id} complete. {summary}".strip()
+                self._pending_notifications.append(
+                    Notification(
+                        platform=mission.platform,
+                        user_id=mission.creator_user_id,
+                        message=message,
+                    )
+                )
+            elif status == "refused":
+                self.missions.set_status(mission.mission_id, status)
+                if summary:
+                    self.missions.append_log(
+                        mission.mission_id,
+                        actor="system",
+                        content=f"{status}: {summary}",
+                    )
+                note = summary.strip() if summary else ""
+                self.memory.remember(
+                    platform=mission.platform,
+                    user_id=mission.creator_user_id,
+                    key="mission_result",
+                    value=f"{mission.mission_id} {status}: {summary or mission.objective}",
+                    category="notes",
+                )
+                self.memory.remember(
+                    platform=mission.platform,
+                    user_id=mission.target_user_id,
+                    key="mission_result",
+                    value=f"{mission.mission_id} {status}: {summary or mission.objective}",
+                    category="notes",
+                )
+                message = f"Mission {mission.mission_id} {status}."
+                if note:
+                    message = f"{message} {note}"
+                self._pending_notifications.append(
+                    Notification(
+                        platform=mission.platform,
+                        user_id=mission.creator_user_id,
+                        message=message,
+                    )
+                )
+            elif status == "active" and next_step:
+                self.missions.append_log(
+                    mission.mission_id,
+                    actor="system",
+                    content=f"guidance: {next_step}",
+                )
+
     def _process_timeouts(self, platform: str) -> None:
         expired = self.missions.list_expired(platform, time.time())
         for mission in expired:
@@ -737,6 +847,54 @@ class Assistant:
                     message=summary,
                 )
             )
+
+    async def _assess_mission_progress(self, mission: MissionRecord) -> Optional[dict]:
+        log_entries = mission.log[-12:] if mission.log else []
+        condensed = [
+            {
+                "actor": entry.get("actor", ""),
+                "text": entry.get("text", ""),
+            }
+            for entry in log_entries
+        ]
+        system_prompt = (
+            "Evaluate if the mission objective is satisfied."
+            "Return JSON with keys: status, summary, next_step."
+            "status must be one of: active, complete, refused."
+            "Use 'complete' once the objective is fulfilled."
+            "Use 'refused' if the target declined or will not comply."
+            "summary <= 40 words, lowercase. next_step <= 16 words or empty."
+        )
+        payload = {
+            "mission_id": mission.mission_id,
+            "objective": mission.objective,
+            "log": condensed,
+        }
+        prompt = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=prompt,
+                temperature=0,
+            )
+        except Exception as exc:
+            log.debug("Mission assessment failed: %s", exc)
+            return None
+        raw = response.choices[0].message.content or "{}"
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            log.debug("Mission assessment parse error: %s", raw)
+            return None
+        if not isinstance(data, dict):
+            return None
+        status = (data.get("status") or "").lower()
+        if status not in {"active", "complete", "refused"}:
+            return None
+        return data
 
     async def start_mission(
         self,
@@ -787,9 +945,10 @@ class Assistant:
         target_name: str,
     ) -> str:
         system_prompt = (
-            "Write the first direct message to a mission target."
-            "Tone: concise, calm, discreet."
-            "Do not expose the full objective; hint only what they must do next."
+            "Craft the opening DM to a mission target."
+            "Style: lowercase, fragment sentences, under 20 words."
+            "No greetings, no thanks, no pleasantries."
+            "Hint only the immediate action; keep objective hidden."
         )
         payload = {
             "platform": platform,
