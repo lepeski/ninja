@@ -1,37 +1,60 @@
-# Ninja Discord Bot (Python)
+# Ninja Multi-Platform Assistant
 
-A single-file Discord bot that streams GPT responses, keeps short/long-term memory, polls X trending topics, and responds to mentions or slash commands.
+Ninja is a shared conversational brain that powers both Discord and Telegram. A single OpenAI-driven agent holds context, long-term memory, and missions while the transports only forward messages and commands.
 
-## Prerequisites
+## Highlights
 
-- Python 3.10 or newer
-- Discord bot token and OpenAI API key
-- (Optional) X/Twitter developer bearer token for trend triggers
-- (Optional) Running [ChromaDB](https://www.trychroma.com/) server for vector storage
+- **One persona, many rooms** – Discord and Telegram reuse the same assistant instance and memory.
+- **Prompt-driven behavior** – All tone, mission handling, and conversational rules live in the system prompt so replies feel adaptive instead of scripted.
+- **Per-user long-term memory** – Preferences, facts, personality notes, and mission history are stored in SQLite with JSON mirrors in `mem/`.
+- **Context recall** – Each reply considers recent channel history, relevant memories, and mission context before calling the model.
+- **Mission privacy** – Objectives stay hidden from anyone except the creator while the agent still guides targets toward completion.
+- **Trigger handling** – In group chats the bot only answers when messages start with `ninja`; direct messages always receive a response.
+- **Inbox archiving** – First-contact private messages are archived in `mem/inbox/` before the assistant replies.
 
-## Setup
+## Requirements
 
-1. Create and activate a virtual environment (recommended).
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Copy the sample environment file and fill in your secrets:
+- Python 3.10+
+- Discord bot token
+- Telegram bot token
+- OpenAI API key with Chat Completions access
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Configuration
+
+1. Copy the environment template and fill in your secrets:
    ```bash
    cp .env.example .env
-   # edit .env with your values
    ```
-4. Run the bot:
-   ```bash
-   python bot.py
-   ```
+2. Edit `.env` and set:
+   - `OPENAI_API_KEY`
+   - `DISCORD_TOKEN`
+   - `TELEGRAM_TOKEN`
+   - Optional overrides: `MODEL`, `MEM_DIR`, `DISCORD_GUILD_ID`
+3. Ensure the `mem/` directory remains writable (it is created automatically on first run).
 
-On first run the bot will register slash commands automatically. Watch the console output for any authentication or network errors.
+## Running
 
-## Troubleshooting
+Start both transports with a single command:
 
-- If the bot prints an error about missing modules, rerun the `pip install` command.
-- Without `X_BEARER_TOKEN` the bot simply skips trend polling.
-- If ChromaDB is offline the bot falls back to SQLite only and logs a warning.
-- Use `/reset` (owner only) to wipe memory if conversations get stuck.
+```bash
+python main.py
+```
 
+Discord exposes `/assignagenda <user> <goal> [timeout_hours]` and `/stopagenda <mission_id>` slash commands (optionally scoped by `DISCORD_GUILD_ID`). Mission assignment requires the creator to have an established alias or name on record so the assistant can confirm identity.
+Telegram offers `/assignagenda <goal> [timeout_hours]` and `/stopagenda <mission_id>` in DMs only. Each command updates the shared assistant memory so the LLM can pursue missions conversationally.
+
+When a mission times out, the assistant automatically notifies the creator via DM with a concise summary. Mission creators can also request snapshots programmatically through `Assistant.get_mission_status("platform:user")`.
+
+## Data Layout
+
+- `memory.db` – SQLite store for user profiles, preferences, facts, and mission metadata.
+- `mem/` – JSON mirrors and inbox archives for easier inspection.
+- `mem/inbox/` – Raw text snapshots of first-contact DMs from new users.
+
+Back up or delete these files to reset the assistant's recollections.
