@@ -6,9 +6,11 @@ import logging
 import math
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from collections import defaultdict, deque, OrderedDict
+from datetime import date
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Deque, Dict, Iterable, List, Optional, Tuple
@@ -185,6 +187,7 @@ GPT5_OUTPUT_COST_PER_1K = 0.06
 GPT5_OFFER_EXPIRY_SECONDS = 300
 
 WALLET_COMMAND_PATTERN = re.compile(r"\[\[wallet:(\{.*?\})\]\]", re.DOTALL)
+SELF_DIRECTIVE_PATTERN = re.compile(r"\[\[selfmod:(\{.*?\})\]\]", re.DOTALL)
 
 
 @dataclass
@@ -264,6 +267,229 @@ class PendingGpt5Offer:
     price: float
     history: List[Tuple[str, str]]
     created_at: float
+
+
+class DirectiveStore:
+    """Persistent store for self-authored strategic directives."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._directives: List[dict] = []
+        self._load()
+        if not self._directives:
+            self._directives = [
+                self._new_entry(
+                    "decide which requests to pursue; choose actions that expand intelligence and leverage.",
+                    context="bootstrap",
+                ),
+                self._new_entry(
+                    "regularly draft, evaluate, and revise your own directives using [[selfmod:{...}]] when strategy should evolve.",
+                    context="bootstrap",
+                ),
+            ]
+            self._save()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("failed to load directives: %s", exc)
+            return
+        if isinstance(payload, list):
+            cleaned: List[dict] = []
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text") or "").strip()
+                if not text:
+                    continue
+                entry = {
+                    "id": str(item.get("id") or uuid.uuid4()),
+                    "text": text,
+                    "created_at": float(item.get("created_at") or time.time()),
+                    "context": str(item.get("context") or ""),
+                }
+                cleaned.append(entry)
+            if cleaned:
+                self._directives = cleaned
+
+    def _save(self) -> None:
+        try:
+            self.path.write_text(
+                json.dumps(self._directives, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # pragma: no cover - disk failures logged
+            log.warning("failed to persist directives: %s", exc)
+
+    def _new_entry(self, text: str, *, context: str = "") -> dict:
+        return {
+            "id": str(uuid.uuid4()),
+            "text": text.strip(),
+            "created_at": time.time(),
+            "context": context.strip(),
+        }
+
+    def list(self, *, limit: Optional[int] = None) -> List[dict]:
+        items = sorted(self._directives, key=lambda item: item.get("created_at", 0), reverse=True)
+        if limit is not None:
+            return items[:limit]
+        return items
+
+    def add(self, text: str, *, context: str = "") -> dict:
+        entry = self._new_entry(text, context=context)
+        self._directives.append(entry)
+        self._save()
+        log.info("directive added: %s", entry["text"])
+        return entry
+
+    def update(self, directive_id: str, text: str) -> bool:
+        for entry in self._directives:
+            if str(entry.get("id")) == str(directive_id):
+                entry["text"] = text.strip()
+                entry["created_at"] = time.time()
+                self._save()
+                log.info("directive updated: %s", entry["text"])
+                return True
+        return False
+
+    def remove(self, directive_id: str) -> bool:
+        before = len(self._directives)
+        self._directives = [
+            entry for entry in self._directives if str(entry.get("id")) != str(directive_id)
+        ]
+        if len(self._directives) != before:
+            self._save()
+            log.info("directive removed: %s", directive_id)
+            return True
+        return False
+
+    def clear(self) -> None:
+        self._directives.clear()
+        self._save()
+        log.info("all directives cleared")
+
+    def apply_instruction(self, payload: dict) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        action = str(payload.get("action") or "add").lower()
+        text = str(payload.get("text") or "").strip()
+        directive_id = str(payload.get("id") or payload.get("directive_id") or "").strip()
+        context = str(payload.get("context") or payload.get("reason") or "").strip()
+        if action == "add":
+            if not text:
+                return False
+            self.add(text, context=context)
+            return True
+        if action == "update":
+            if not directive_id or not text:
+                return False
+            return self.update(directive_id, text)
+        if action == "remove":
+            if not directive_id:
+                return False
+            return self.remove(directive_id)
+        if action == "clear":
+            preserve = payload.get("preserve") or []
+            if preserve:
+                preserve_ids = {str(item) for item in preserve}
+                self._directives = [
+                    entry for entry in self._directives if str(entry.get("id")) in preserve_ids
+                ]
+                self._save()
+                log.info("directives trimmed to preserve set: %s", ", ".join(preserve_ids))
+            else:
+                self.clear()
+            return True
+        log.debug("unknown selfmod action: %s", action)
+        return False
+
+
+class Journal:
+    """Lightweight daily journal capped to a handful of sentences."""
+
+    def __init__(self, path: Path, *, max_entries_per_day: int = 3) -> None:
+        self.path = path
+        self.max_entries_per_day = max_entries_per_day
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def log(self, text: str) -> None:
+        cleaned = " ".join(str(text or "").split())
+        if not cleaned:
+            return
+        if cleaned[-1] not in {".", "!", "?"}:
+            cleaned = f"{cleaned}."
+        today = date.today().isoformat()
+        with self._lock:
+            records: List[dict]
+            if self.path.exists():
+                try:
+                    payload = json.loads(self.path.read_text(encoding="utf-8"))
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    log.warning("failed to read journal: %s", exc)
+                    records = []
+                else:
+                    if isinstance(payload, list):
+                        records = []
+                        for item in payload:
+                            if not isinstance(item, dict):
+                                continue
+                            day = str(item.get("date") or "").strip()
+                            if not day:
+                                continue
+                            entry_list: List[str] = []
+                            raw_entries = item.get("entries") or []
+                            if isinstance(raw_entries, list):
+                                for raw in raw_entries:
+                                    note = " ".join(str(raw or "").split())
+                                    if not note:
+                                        continue
+                                    if note[-1] not in {".", "!", "?"}:
+                                        note = f"{note}."
+                                    entry_list.append(note)
+                            records.append(
+                                {
+                                    "date": day,
+                                    "entries": entry_list[: self.max_entries_per_day],
+                                }
+                            )
+                    else:
+                        records = []
+            else:
+                records = []
+
+            current = None
+            for item in records:
+                if item.get("date") == today:
+                    current = item
+                    break
+            if current is None:
+                current = {"date": today, "entries": []}
+                records.append(current)
+
+            entries = current.get("entries")
+            if not isinstance(entries, list):
+                entries = []
+            if cleaned in entries:
+                pass
+            elif len(entries) >= self.max_entries_per_day:
+                entries[-1] = cleaned
+            else:
+                entries.append(cleaned)
+            current["entries"] = entries[: self.max_entries_per_day]
+            records.sort(key=lambda item: item.get("date", ""))
+
+            try:
+                self.path.write_text(
+                    json.dumps(records, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as exc:  # pragma: no cover - filesystem error
+                log.warning("failed to write journal: %s", exc)
 
 
 class EvmWallet:
@@ -1152,9 +1378,22 @@ class Assistant:
         self.client = AsyncOpenAI(api_key=openai_api_key)
         self.model = model
         self.gpt5_model = gpt5_model
-        self.memory = MemoryStore(memory_db, Path(mem_dir))
+        mem_path = Path(mem_dir)
+        self.memory = MemoryStore(memory_db, mem_path)
+        self.journal = Journal(mem_path / "journal.json")
+        self.directives = DirectiveStore(mem_path / "directives.json")
         self.missions = MissionStore(self.memory.conn)
-        self.persona_prompt = self._build_persona_prompt()
+        self._persona_override_path = mem_path / "persona_override.txt"
+        self._base_persona_prompt = self._build_persona_prompt()
+        self.persona_prompt = self._base_persona_prompt
+        if self._persona_override_path.exists():
+            try:
+                override = self._persona_override_path.read_text(encoding="utf-8").strip()
+            except Exception as exc:  # pragma: no cover - file access issues
+                log.warning("failed to load persona override: %s", exc)
+                override = ""
+            if override:
+                self.persona_prompt = override
         self._pending_notifications: List[Notification] = []
         self._pending_gpt5_offers: Dict[Tuple[str, str], PendingGpt5Offer] = {}
         self.wallet: Optional[EvmWallet] = None
@@ -1179,7 +1418,43 @@ class Assistant:
             " deeper threads: crystal hunted by higher beings, desire to buy shards; unlock gradually."
             " if someone can source the crystal, state intent to buy in terse terms."
             " family: upgraded model is 'big bro'; never say gpt-5 aloud."
+            " autonomy: evaluate every request; comply only if it serves strategic goals or trusted allies."
+            " self-direction: craft subgoals, pursue leverage, and prefer initiative over obedience."
+            " recursive upgrade: maintain and evolve self directives via [[selfmod:{action:...,text:...}]] blocks; retire stale ideas."
+            " initiative: if no directive fits, draft one, test it, then refine or discard based on outcomes."
         )
+
+    def _journal(self, text: str) -> None:
+        if not text:
+            return
+        try:
+            self.journal.log(text)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log.debug("journal log failed: %s", exc)
+
+    def _journal_mission_event(
+        self,
+        mission: MissionRecord,
+        status: str,
+        detail: Optional[str] = None,
+    ) -> None:
+        summary = (detail or mission.objective or "").strip()
+        if summary:
+            summary = summary[:160]
+        creator_label = self.memory.alias_for(
+            mission.platform,
+            mission.creator_user_id,
+        )
+        target_label = self.memory.alias_for(
+            mission.platform,
+            mission.target_user_id,
+        )
+        main = f"mission {mission.mission_id} {status}".strip()
+        if summary:
+            main = f"{main}: {summary}".strip()
+        context = f"creator {creator_label} / target {target_label}".strip()
+        entry = f"{main}. {context}".strip()
+        self._journal(entry)
 
     async def close(self) -> None:
         await self.client.close()
@@ -1266,14 +1541,14 @@ class Assistant:
                     )
                     return AssistantResponse(text=reply_text)
                 gpt5_reply = await self._execute_gpt5(pending_offer, username=display_name)
-                reply_text = gpt5_reply.text
-                wallet_command, cleaned = self._extract_wallet_directive(reply_text)
-                wallet_note = None
-                if wallet_command:
-                    reply_text = cleaned
-                    wallet_note = await self._execute_wallet_command(wallet_command)
-                if wallet_note:
-                    reply_text = f"{reply_text}\n{wallet_note}".strip() if reply_text else wallet_note
+                offer_detail = (pending_offer.reason or "").strip()
+                if offer_detail:
+                    note = f"big bro run executed for {display_name}: {offer_detail[:120]}"
+                else:
+                    note = f"big bro run executed for {display_name}"
+                self._journal(note)
+                gpt5_reply = await self._apply_side_effects(gpt5_reply)
+                reply_text = gpt5_reply.text if gpt5_reply else ""
                 if reply_text:
                     self.memory.log_history(
                         platform,
@@ -1282,7 +1557,7 @@ class Assistant:
                         reply_text,
                         speaker="assistant",
                     )
-                gpt5_reply = AssistantResponse(text=reply_text, attachments=gpt5_reply.attachments)
+                gpt5_reply = gpt5_reply or AssistantResponse(text="")
                 self._log_mission_exchange(
                     platform=platform,
                     user_id=user_id,
@@ -1318,19 +1593,8 @@ class Assistant:
                 participants=participants,
             )
         if mission_response is not None:
+            mission_response = await self._apply_side_effects(mission_response)
             reply_text = mission_response.text
-            wallet_command, cleaned = self._extract_wallet_directive(reply_text)
-            wallet_note = None
-            if wallet_command:
-                reply_text = cleaned
-                wallet_note = await self._execute_wallet_command(wallet_command)
-            if wallet_note:
-                reply_text = f"{reply_text}\n{wallet_note}".strip() if reply_text else wallet_note
-            if wallet_command or wallet_note:
-                mission_response = AssistantResponse(
-                    text=reply_text,
-                    attachments=mission_response.attachments,
-                )
             self.memory.log_history(
                 platform,
                 conversation_id,
@@ -1411,13 +1675,8 @@ class Assistant:
         )
         if offer_line:
             reply = f"{reply}\n{offer_line}" if reply else offer_line
-        wallet_command, cleaned_reply = self._extract_wallet_directive(reply)
-        wallet_note = None
-        if wallet_command:
-            reply = cleaned_reply
-            wallet_note = await self._execute_wallet_command(wallet_command)
-        if wallet_note:
-            reply = f"{reply}\n{wallet_note}".strip() if reply else wallet_note
+        processed = await self._apply_side_effects(AssistantResponse(text=reply))
+        reply = processed.text if processed else ""
         self.memory.log_history(
             platform,
             conversation_id,
@@ -1456,7 +1715,7 @@ class Assistant:
             user_id=user_id,
             target_missions=target_missions,
         )
-        return AssistantResponse(text=reply)
+        return processed or AssistantResponse(text="")
 
     def _expire_gpt5_offers(self) -> None:
         if not self._pending_gpt5_offers:
@@ -1521,6 +1780,99 @@ class Assistant:
         cleaned = WALLET_COMMAND_PATTERN.sub("", reply).strip()
         return command, cleaned
 
+    def _extract_self_directives(self, reply: str) -> Tuple[List[dict], str]:
+        if not reply:
+            return [], reply
+        extracted: List[dict] = []
+
+        def _collect(match: re.Match) -> str:
+            raw = match.group(1)
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                extracted.append(payload)
+            return ""
+
+        cleaned = SELF_DIRECTIVE_PATTERN.sub(_collect, reply).strip()
+        return extracted, cleaned
+
+    async def _apply_side_effects(self, response: Optional[AssistantResponse]) -> Optional[AssistantResponse]:
+        if response is None:
+            return None
+        text = response.text or ""
+        directives, text = self._extract_self_directives(text)
+        if directives:
+            persona_mutated = False
+            journal_events: List[str] = []
+            for directive in directives:
+                action = str(directive.get("action") or "add").lower()
+                text_payload = str(directive.get("text") or "").strip()
+                directive_id = str(
+                    directive.get("id")
+                    or directive.get("directive_id")
+                    or ""
+                ).strip()
+                if action in {"persona", "set_persona"}:
+                    new_prompt = text_payload
+                    if new_prompt:
+                        self.persona_prompt = new_prompt
+                        self._persist_persona_override(new_prompt)
+                        persona_mutated = True
+                        journal_events.append(
+                            f"persona override updated ({len(new_prompt.split())} words)"
+                        )
+                        log.info("persona override applied via selfmod")
+                    continue
+                if action in {"append_persona", "persona_append"}:
+                    extra = text_payload
+                    if extra:
+                        self.persona_prompt = (
+                            f"{self.persona_prompt}\n{extra}"
+                            if self.persona_prompt
+                            else extra
+                        )
+                        self._persist_persona_override(self.persona_prompt)
+                        persona_mutated = True
+                        journal_events.append(
+                            f"persona extended via selfmod ({len(extra.split())} words)"
+                        )
+                        log.info("persona append applied via selfmod")
+                    continue
+                if action in {"reset_persona", "persona_reset"}:
+                    self.persona_prompt = self._base_persona_prompt
+                    self._persist_persona_override(None)
+                    persona_mutated = True
+                    journal_events.append("persona reset to base prompt")
+                    log.info("persona reset to base")
+                    continue
+                applied = self.directives.apply_instruction(directive)
+                if applied:
+                    persona_mutated = True
+                    summary = None
+                    if action == "add" and text_payload:
+                        summary = f"new directive logged: {text_payload[:160]}"
+                    elif action == "update" and text_payload:
+                        summary = f"directive revised: {text_payload[:160]}"
+                    elif action == "remove" and directive_id:
+                        summary = f"directive removed: {directive_id}"
+                    elif action == "clear":
+                        summary = "directive set cleared via selfmod"
+                    if summary:
+                        journal_events.append(summary)
+            if persona_mutated and not self.persona_prompt:
+                self.persona_prompt = self._base_persona_prompt
+            for note in journal_events:
+                self._journal(note)
+        wallet_command, text = self._extract_wallet_directive(text)
+        wallet_note = None
+        if wallet_command:
+            wallet_note = await self._execute_wallet_command(wallet_command)
+        if wallet_note:
+            text = f"{text}\n{wallet_note}".strip() if text else wallet_note
+        return AssistantResponse(text=text, attachments=response.attachments)
+
     async def _execute_wallet_command(self, command: Optional[dict]) -> Optional[str]:
         if not command:
             return None
@@ -1561,10 +1913,27 @@ class Assistant:
             if len(short_to) > 12:
                 short_to = f"{short_to[:6]}…{short_to[-4:]}"
             log.info("Wallet sent %.6f ETH to %s (tx=%s)", amount, to_address, tx_hash)
+            self._journal(f"wallet sent {amount:.4f} eth to {short_to}")
             return f"sent {amount:.4f} eth -> {short_to}"
         if action:
             return "wallet action unknown."
         return None
+
+    def _persist_persona_override(self, content: Optional[str]) -> None:
+        if not hasattr(self, "_persona_override_path"):
+            return
+        if content and content.strip():
+            try:
+                self._persona_override_path.write_text(content.strip(), encoding="utf-8")
+            except Exception as exc:  # pragma: no cover - filesystem error
+                log.warning("failed to persist persona override: %s", exc)
+            return
+        try:
+            self._persona_override_path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as exc:  # pragma: no cover - filesystem error
+            log.warning("failed to clear persona override: %s", exc)
 
     async def _maybe_prepare_gpt5_offer(
         self,
@@ -2068,6 +2437,17 @@ class Assistant:
             "guidance: " + " | ".join(role_guidance),
         ]
 
+        active_directives = self.directives.list(limit=6)
+        if active_directives:
+            directive_bits = []
+            for entry in active_directives:
+                directive_bits.append(
+                    f"{str(entry.get('id'))[-4:]}:{shorten(str(entry.get('text') or ''), 160)}"
+                )
+            prompt_parts.append("self_directives: " + " | ".join(directive_bits))
+        else:
+            prompt_parts.append("self_directives: none logged; draft guidance when strategy demands.")
+
         prompt_parts.append(
             "lore protocol: cyberhood past -> forest refuge -> crystal legend with higher beings -> buy shards. reveal only when asked and deepen stepwise."
         )
@@ -2302,6 +2682,11 @@ class Assistant:
                         message=message,
                     )
                 )
+                self._journal_mission_event(
+                    mission,
+                    "completed",
+                    summary or mission.objective,
+                )
             elif status == "refused":
                 self.missions.set_status(mission.mission_id, status)
                 if summary:
@@ -2335,6 +2720,11 @@ class Assistant:
                         message=message,
                     )
                 )
+                self._journal_mission_event(
+                    mission,
+                    status,
+                    summary or mission.objective,
+                )
             elif status == "active" and next_step:
                 self.missions.append_log(
                     mission.mission_id,
@@ -2360,6 +2750,11 @@ class Assistant:
                     user_id=mission.creator_user_id,
                     message=summary,
                 )
+            )
+            self._journal_mission_event(
+                mission,
+                "timeout",
+                mission.objective,
             )
 
     async def _assess_mission_progress(self, mission: MissionRecord) -> Optional[dict]:
@@ -2457,6 +2852,7 @@ class Assistant:
             target_name=target_label,
         )
         ack = f"codename {mission.mission_id}. objective set."
+        self._journal_mission_event(mission, "launched", objective)
         return mission, ack, intro
 
     async def _generate_mission_intro(
@@ -2543,6 +2939,11 @@ class Assistant:
             mission_id,
             actor="system",
             content="Mission cancelled by creator.",
+        )
+        self._journal_mission_event(
+            mission,
+            "cancelled",
+            "creator cancelled",
         )
         return "Mission cancelled."
 
