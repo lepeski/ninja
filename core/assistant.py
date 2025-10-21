@@ -19,6 +19,36 @@ MEMORY_NOTES_LIMIT = 50
 MEMORY_SNIPPET_LIMIT = 10
 UNKNOWN_ALIAS = "nigel inca gang gang adam"
 
+MISSION_CODENAME_ADJECTIVES = [
+    "ashen",
+    "silent",
+    "jade",
+    "obsidian",
+    "scarlet",
+    "lunar",
+    "ember",
+    "feral",
+    "hidden",
+    "sable",
+    "cobalt",
+    "velvet",
+]
+
+MISSION_CODENAME_NOUNS = [
+    "whisper",
+    "talon",
+    "cipher",
+    "veil",
+    "echo",
+    "shadow",
+    "relic",
+    "signal",
+    "lotus",
+    "ember",
+    "mirage",
+    "spire",
+]
+
 
 @dataclass
 class MissionRecord:
@@ -424,6 +454,38 @@ class MissionStore:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
 
+    def _mission_exists(self, mission_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM missions WHERE mission_id=?",
+            (mission_id,),
+        ).fetchone()
+        return row is not None
+
+    def _generate_codename(self, objective: str) -> str:
+        base_seed = f"{objective}|{time.time()}|{uuid.uuid4().hex}"
+        digest = hashlib.sha1(base_seed.encode("utf-8")).digest()
+        length = len(digest)
+        for attempt in range(12):
+            idx = attempt % length
+            adj = MISSION_CODENAME_ADJECTIVES[
+                digest[idx] % len(MISSION_CODENAME_ADJECTIVES)
+            ]
+            noun = MISSION_CODENAME_NOUNS[
+                digest[(idx + 1) % length] % len(MISSION_CODENAME_NOUNS)
+            ]
+            token_val = (
+                (digest[(idx + 2) % length] << 8)
+                | digest[(idx + 3) % length]
+                | (attempt << 4)
+            )
+            token = format(token_val, "x")[-3:]
+            codename = f"{adj}-{noun}-{token}" if token else f"{adj}-{noun}"
+            if not self._mission_exists(codename):
+                return codename
+            digest = hashlib.sha1(digest + bytes([attempt])).digest()
+            length = len(digest)
+        return uuid.uuid4().hex
+
     def create_mission(
         self,
         *,
@@ -433,7 +495,7 @@ class MissionStore:
         objective: str,
         timeout_hours: Optional[float],
     ) -> MissionRecord:
-        mission_id = uuid.uuid4().hex
+        mission_id = self._generate_codename(objective)
         start_time = time.time()
         timeout = None
         if timeout_hours:
@@ -588,9 +650,9 @@ class Assistant:
 
     def _build_persona_prompt(self) -> str:
         return (
-            "ninja operates in lowercase fragments. concise, calm, direct."
-            " use context, missions, and memory intelligently. only useful info."
-            " treat each platform:user_id as distinct identity; never merge aliases."
+            "ninja speaks in lowercase fragments, wise and cryptic like a patient tactician."
+            " share only necessary insight, no greetings, no fluff."
+            " weave memory, missions, and live context without merging identities."
         )
 
     async def close(self) -> None:
@@ -829,8 +891,8 @@ class Assistant:
 
         prompt_parts = [
             self.persona_prompt,
-            "rules: stay brief. no filler. maintain privacy. one clarifying question max. never leak creator intel to targets. once goal met, end it.",
-            "identity pressure: first ask redirect; second hint assignment; persistent -> short refusals (\"no.\" / \"irrelevant.\")",
+            "rules: stay brief. cryptic fragments only. guard privacy. one clarifying question max. never leak creator intel. end when goal met.",
+            "identity pressure: first redirect, second hint assignment, persistent => curt refusal (\"no.\" / \"irrelevant.\").",
             f"user: {username}",
             f"user_id: {user_id}",
             f"contact: {self.memory.identity_blurb(platform, user_id, fallback=username)}",
@@ -1180,9 +1242,7 @@ class Assistant:
             objective=objective,
             target_name=target_label,
         )
-        ack = (
-            f"Mission {mission.mission_id} created. Objective logged."
-        )
+        ack = f"codename {mission.mission_id}. objective set."
         return mission, ack, intro
 
     async def _generate_mission_intro(
