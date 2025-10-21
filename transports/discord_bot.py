@@ -1,5 +1,6 @@
 import logging
-from typing import Optional
+from collections import defaultdict, deque
+from typing import Dict, List, Optional
 
 import discord
 from discord import app_commands
@@ -10,14 +11,82 @@ from core.assistant import Notification
 log = logging.getLogger(__name__)
 
 
+def should_bot_reply(message: discord.Message, recent_messages: List[Dict], bot_user: Optional[discord.User]) -> bool:
+    """Determine whether the bot should reply to a group message."""
+
+    if message.guild is None:
+        return True
+
+    content = message.content or ""
+    stripped = content.strip()
+    lowered = stripped.lower()
+    bot_id = bot_user.id if bot_user else None
+
+    # Signal A: direct summons or command prefixes.
+    if lowered.startswith("ninja"):
+        return True
+    if stripped.startswith("!"):
+        return True
+    if bot_id is not None:
+        if any(user.id == bot_id for user in message.mentions):
+            return True
+        raw_id = str(bot_id)
+        if f"<@{raw_id}>" in content or f"<@!{raw_id}>" in content:
+            return True
+
+    # Signal B heuristics.
+    lowered_no_punct = lowered
+    second_person_triggers = [
+        "can you",
+        "could you",
+        "would you",
+        "will you",
+        "should i",
+        "what should i",
+        "how do i",
+        "do you know",
+        "you think",
+        "your take",
+        "are you",
+        "did you",
+    ]
+
+    mentions_other = any(
+        mention.id != bot_id for mention in message.mentions
+    ) if message.mentions else False
+
+    question_without_target = "?" in content and not mentions_other
+    if question_without_target:
+        return True
+
+    if any(trigger in lowered_no_punct for trigger in second_person_triggers):
+        return True
+
+    if recent_messages:
+        last_bot_message = next(
+            (entry for entry in reversed(recent_messages) if entry.get("from_bot")),
+            None,
+        )
+        if last_bot_message:
+            if "you" in lowered_no_punct or "your" in lowered_no_punct:
+                return True
+            if any(word in lowered_no_punct for word in ["that", "this", "those", "it"]):
+                if any(starter in lowered_no_punct for starter in ["what", "why", "how", "when", "where"]):
+                    return True
+
+    return False
+
+
 class DiscordTransport(commands.Bot):
     def __init__(self, assistant, *, guild_id: Optional[int] = None):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.members = True
-        super().__init__(command_prefix="!", intents=intents)
+        self._primary_prefix = "!"
+        super().__init__(command_prefix=self._primary_prefix, intents=intents)
         self.assistant = assistant
         self.guild_id = guild_id
+        self._recent_messages: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
 
     async def setup_hook(self) -> None:
         self.tree.add_command(self._assign_agenda())
@@ -89,35 +158,13 @@ class DiscordTransport(commands.Bot):
         channel_id = str(message.channel.id)
         is_dm = message.guild is None
         content = message.content
-        triggered = is_dm
-        if not triggered:
-            stripped = content.strip()
-            lowered = stripped.lower()
-            if lowered.startswith("ninja"):
-                triggered = True
-                stripped = stripped[len("ninja") :].lstrip(" ,:;-\t")
-                if not stripped:
-                    stripped = "ninja"
-            elif self.user and self.user.mention in content:
-                triggered = True
-            elif self.user and any(
-                variant in content
-                for variant in (f"<@{self.user.id}>", f"<@!{self.user.id}>")
-            ):
-                triggered = True
-            if not triggered:
+        if not is_dm:
+            recent = list(self._recent_messages[channel_id])
+            if not should_bot_reply(message, recent, self.user):
+                self._remember_channel_message(channel_id, str(message.author.id), content, False)
                 return
-            if stripped != content.strip():
-                content = stripped
-            elif self.user and triggered:
-                for variant in (
-                    self.user.mention,
-                    f"<@{self.user.id}>",
-                    f"<@!{self.user.id}>",
-                ):
-                    if variant in content:
-                        content = content.replace(variant, "", 1).strip()
-                        break
+            self._remember_channel_message(channel_id, str(message.author.id), content, False)
+            content = self._strip_direct_invocation(content, message)
             if not content.strip():
                 content = "ninja"
         try:
@@ -134,6 +181,13 @@ class DiscordTransport(commands.Bot):
             result = "I'm not available right now."
         if result:
             await message.channel.send(result, reference=message if not is_dm else None)
+            if not is_dm:
+                self._remember_channel_message(
+                    channel_id,
+                    str(self.user.id) if self.user else "bot",
+                    result,
+                    True,
+                )
         await self._deliver_notifications()
 
     async def _deliver_notifications(self) -> None:
@@ -148,6 +202,41 @@ class DiscordTransport(commands.Bot):
                 await user_obj.send(note.message)
             except Exception as exc:
                 log.warning("Failed to deliver notification to %s: %s", note.user_id, exc)
+
+    def _remember_channel_message(
+        self, channel_id: str, author_id: str, content: str, from_bot: bool
+    ) -> None:
+        if not channel_id:
+            return
+        history = self._recent_messages[channel_id]
+        history.append(
+            {
+                "author_id": author_id,
+                "content": content,
+                "from_bot": from_bot,
+            }
+        )
+
+    def _strip_direct_invocation(self, content: str, message: discord.Message) -> str:
+        stripped = content.strip()
+        lowered = stripped.lower()
+        if lowered.startswith("ninja"):
+            trimmed = stripped[len("ninja") :].lstrip(" ,:;-\t")
+            return trimmed or "ninja"
+        if stripped.startswith(self._primary_prefix):
+            trimmed = stripped[len(self._primary_prefix) :].lstrip()
+            return trimmed or stripped
+        if self.user and any(user.id == self.user.id for user in message.mentions):
+            cleaned = content
+            for variant in (
+                self.user.mention,
+                f"<@{self.user.id}>",
+                f"<@!{self.user.id}>",
+            ):
+                if variant in cleaned:
+                    cleaned = cleaned.replace(variant, "", 1).strip()
+            return cleaned or ""
+        return content
 
 
 async def run_discord_bot(assistant, token: str, guild_id: Optional[int] = None):
