@@ -126,6 +126,16 @@ class MemoryStore:
         self._load_alias_index()
 
     @staticmethod
+    def _empty_bio() -> dict:
+        return {
+            "summary": "",
+            "facts": {},
+            "traits": [],
+            "relationships": {},
+            "notes": [],
+        }
+
+    @staticmethod
     def _normalize_alias(alias: Optional[str]) -> str:
         return str(alias or "").strip().lower()
 
@@ -231,6 +241,7 @@ class MemoryStore:
             "facts": {},
             "personality": [],
             "notes": [],
+            "bio": self._empty_bio(),
             "last_seen": time.time(),
         }
 
@@ -252,6 +263,7 @@ class MemoryStore:
         profile.setdefault("facts", {})
         profile.setdefault("personality", [])
         profile.setdefault("notes", [])
+        profile.setdefault("bio", self._empty_bio())
         profile["last_seen"] = time.time()
         self._save(platform, user_id, profile)
         return profile
@@ -262,6 +274,7 @@ class MemoryStore:
         payload.setdefault("facts", {})
         payload.setdefault("personality", [])
         payload.setdefault("notes", [])
+        payload.setdefault("bio", self._empty_bio())
         with self.conn:
             self.conn.execute(
                 """
@@ -315,6 +328,72 @@ class MemoryStore:
         ):
             profile["alias"] = normalized_value
         self._save(platform, user_id, profile)
+
+    def update_bio(self, platform: str, user_id: str, bio_update: dict) -> None:
+        if not bio_update or not isinstance(bio_update, dict):
+            return
+        profile = self.recall(platform, user_id)
+        bio = profile.get("bio") or self._empty_bio()
+        changed = False
+
+        summary = str(bio_update.get("summary") or "").strip()
+        if summary and bio.get("summary") != summary:
+            bio["summary"] = summary
+            changed = True
+
+        facts_update = bio_update.get("facts")
+        if isinstance(facts_update, dict):
+            for key, value in facts_update.items():
+                clean_key = str(key or "").strip()
+                clean_value = str(value or "").strip()
+                if not clean_key or not clean_value:
+                    continue
+                if bio.setdefault("facts", {}).get(clean_key) != clean_value:
+                    bio["facts"][clean_key] = clean_value
+                    changed = True
+
+        traits_update = bio_update.get("traits")
+        if isinstance(traits_update, list):
+            cleaned = []
+            seen = set()
+            for item in traits_update:
+                trait = str(item or "").strip()
+                if not trait or trait in seen:
+                    continue
+                seen.add(trait)
+                cleaned.append(trait)
+            if cleaned and cleaned != bio.get("traits", []):
+                bio["traits"] = cleaned
+                changed = True
+
+        relationships_update = bio_update.get("relationships")
+        if isinstance(relationships_update, dict):
+            for key, value in relationships_update.items():
+                clean_key = str(key or "").strip()
+                clean_value = str(value or "").strip()
+                if not clean_key or not clean_value:
+                    continue
+                if bio.setdefault("relationships", {}).get(clean_key) != clean_value:
+                    bio["relationships"][clean_key] = clean_value
+                    changed = True
+
+        notes_update = bio_update.get("notes")
+        if isinstance(notes_update, list):
+            existing = bio.setdefault("notes", [])
+            for note in notes_update:
+                clean_note = str(note or "").strip()
+                if not clean_note:
+                    continue
+                if clean_note in existing:
+                    continue
+                existing.append(clean_note)
+                changed = True
+            if len(existing) > 8:
+                bio["notes"] = existing[-8:]
+
+        if changed:
+            profile["bio"] = bio
+            self._save(platform, user_id, profile)
 
     def is_known(self, platform: str, user_id: str) -> bool:
         profile = self.recall(platform, user_id)
@@ -766,6 +845,41 @@ class Assistant:
         )
         return reply
 
+    async def observe_message(
+        self,
+        *,
+        platform: str,
+        user_id: str,
+        message: str,
+        username: Optional[str] = None,
+        channel_id: Optional[str] = None,
+    ) -> None:
+        if not message:
+            return
+        trimmed = message.strip()
+        if not trimmed:
+            return
+        self._process_timeouts(platform)
+        conversation_id = channel_id or user_id
+        profile = self.memory.recall(platform, user_id)
+        display_name = self.memory.display_name(
+            platform,
+            user_id,
+            username or user_id,
+            profile=profile,
+        )
+        self.memory.register_participant(
+            platform, conversation_id, user_id, display_name
+        )
+        await self._extract_memories(
+            platform=platform,
+            user_id=user_id,
+            username=display_name,
+            last_user=trimmed,
+            last_reply="",
+            profile=profile,
+        )
+
     def _compose_system_prompt(
         self,
         *,
@@ -815,6 +929,14 @@ class Assistant:
             key = str(note.get("key", "note"))
             value = shorten(str(note.get("value", "")), 80)
             add_memory_bit(f"note {key}={value}")
+        bio = profile.get("bio") or {}
+        summary = str(bio.get("summary") or "").strip()
+        if summary:
+            add_memory_bit(f"bio {shorten(summary, 120)}")
+        for key, value in list((bio.get("facts") or {}).items())[:3]:
+            add_memory_bit(f"biofact {key}={value}")
+        for trait in (bio.get("traits") or [])[:3]:
+            add_memory_bit(f"biotrait {trait}")
         if not memory_bits:
             memory_bits.append("no saved context")
 
@@ -889,21 +1011,6 @@ class Assistant:
             else:
                 target_lines.append(line)
 
-        roster: Dict[Tuple[str, str], str] = {}
-        for mission in owner_missions + target_missions:
-            roster[(mission.platform, mission.creator_user_id)] = track_placeholders(
-                self.memory.identity_blurb(
-                    mission.platform,
-                    mission.creator_user_id,
-                )
-            )
-            roster[(mission.platform, mission.target_user_id)] = track_placeholders(
-                self.memory.identity_blurb(
-                    mission.platform,
-                    mission.target_user_id,
-                )
-            )
-
         is_creator = bool(owner_missions)
         is_target = bool(target_missions)
         role_tags: List[str] = []
@@ -952,12 +1059,6 @@ class Assistant:
                     f"{p_platform}:{p_user}=>{track_placeholders(self.memory.identity_blurb(p_platform, p_user, fallback=name))}"
                 )
             prompt_parts.append("participants: " + " | ".join(sorted(set(participant_bits))))
-        if roster:
-            roster_bits = [
-                f"{plat}:{uid}=>{label}"
-                for (plat, uid), label in roster.items()
-            ]
-            prompt_parts.append("roster: " + " | ".join(sorted(roster_bits)))
 
         if placeholder_tokens:
             prompt_parts.append(
@@ -1018,10 +1119,13 @@ class Assistant:
         profile: dict,
     ) -> None:
         extractor_system = (
-            "You review the latest exchange and decide if anything should be saved as long-term memory. "
-            "Return a JSON array of items with keys: category (preferences|facts|personality|notes), key, value. "
+            "Review the latest exchange and quietly update long-term intel. "
+            "Return a JSON object with keys 'memories' and 'bio'. "
+            "'memories' is an array of items with category (preferences|facts|personality|notes), key, value. "
+            "'bio' is an object with optional keys summary, facts, traits, relationships, notes. "
+            "Summaries stay within two sentences. Notes are short bullets. Skip trivial or one-off data. "
             "Only store alias/name data if the user explicitly shared their own identity. "
-            "Return an empty array if nothing matters."
+            "If nothing new, return {\"memories\": [], \"bio\": {}}."
         )
         payload = {
             "platform": platform,
@@ -1030,6 +1134,7 @@ class Assistant:
             "user_message": last_user,
             "assistant_reply": last_reply,
             "existing_memory": profile,
+            "existing_bio": profile.get("bio"),
         }
         prompt = [
             {"role": "system", "content": extractor_system},
@@ -1044,15 +1149,24 @@ class Assistant:
         except Exception as exc:
             log.debug("Memory extraction failed: %s", exc)
             return
-        raw = response.choices[0].message.content or "[]"
+        raw = response.choices[0].message.content or "{}"
         try:
             items = json.loads(raw)
         except json.JSONDecodeError:
             log.debug("Could not decode memory extraction payload: %s", raw)
             return
-        if not isinstance(items, list):
-            return
-        for item in items:
+        bio_update: dict = {}
+        memory_items: List[dict]
+        if isinstance(items, dict):
+            memory_items = items.get("memories", []) or []
+            possible_bio = items.get("bio") or {}
+            if isinstance(possible_bio, dict):
+                bio_update = possible_bio
+        elif isinstance(items, list):
+            memory_items = items
+        else:
+            memory_items = []
+        for item in memory_items:
             if not isinstance(item, dict):
                 continue
             category = item.get("category", "notes")
@@ -1067,6 +1181,8 @@ class Assistant:
                 value=value,
                 category=category,
             )
+        if bio_update:
+            self.memory.update_bio(platform, user_id, bio_update)
 
     async def _evaluate_missions_for_user(
         self,

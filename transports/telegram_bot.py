@@ -35,7 +35,9 @@ class TelegramTransport:
         message = update.effective_message
         user = update.effective_user
         chat = update.effective_chat
-        if not message or not message.text or not user or user.is_bot or not chat:
+        if not message or not message.text or not user or not chat:
+            return
+        if context.bot and user.id == context.bot.id:
             return
         is_dm = chat.type == ChatType.PRIVATE
         text = message.text
@@ -54,9 +56,16 @@ class TelegramTransport:
                 if mention_prefix and lowered.startswith(mention_prefix):
                     triggered = True
                     stripped = stripped[len(mention_prefix) :].lstrip(" ,:;-\t")
-                    if not stripped:
-                        stripped = "ninja"
+                if not stripped:
+                    stripped = "ninja"
             if not triggered:
+                await self.assistant.observe_message(
+                    platform="telegram",
+                    user_id=str(user.id),
+                    message=text,
+                    username=user.full_name or user.username or str(user.id),
+                    channel_id=str(chat.id),
+                )
                 return
             text = stripped
         if not text.strip():

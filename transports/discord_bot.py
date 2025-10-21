@@ -153,7 +153,9 @@ class DiscordTransport(commands.Bot):
         log.info("Discord bot ready as %s", self.user)
 
     async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.content:
+        if not message or not message.content:
+            return
+        if self.user and message.author.id == self.user.id:
             return
         channel_id = str(message.channel.id)
         is_dm = message.guild is None
@@ -162,6 +164,13 @@ class DiscordTransport(commands.Bot):
             recent = list(self._recent_messages[channel_id])
             if not should_bot_reply(message, recent, self.user):
                 self._remember_channel_message(channel_id, str(message.author.id), content, False)
+                await self.assistant.observe_message(
+                    platform="discord",
+                    user_id=str(message.author.id),
+                    message=content,
+                    username=message.author.display_name,
+                    channel_id=channel_id,
+                )
                 return
             self._remember_channel_message(channel_id, str(message.author.id), content, False)
             content = self._strip_direct_invocation(content, message)
