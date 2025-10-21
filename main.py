@@ -21,6 +21,9 @@ async def main():
     mem_dir = os.getenv("MEM_DIR", "mem")
     guild_id_raw = os.getenv("DISCORD_GUILD_ID")
     guild_id = int(guild_id_raw) if guild_id_raw and guild_id_raw.isdigit() else None
+    evm_rpc_url = os.getenv("EVM_RPC_URL")
+    wallet_private_key = os.getenv("EVM_WALLET_PRIVATE_KEY")
+    wallet_address = os.getenv("EVM_WALLET_ADDRESS")
 
     if not openai_key or not discord_token or not telegram_token:
         raise SystemExit("Missing required environment variables.")
@@ -29,6 +32,9 @@ async def main():
         openai_api_key=openai_key,
         model=model,
         mem_dir=mem_dir,
+        evm_rpc_url=evm_rpc_url,
+        wallet_private_key=wallet_private_key,
+        wallet_address=wallet_address,
     )
 
     telegram_transport = TelegramTransport(assistant, telegram_token)

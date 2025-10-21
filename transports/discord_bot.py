@@ -1,3 +1,4 @@
+import io
 import logging
 from collections import defaultdict, deque
 from typing import Dict, List, Optional
@@ -6,7 +7,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from core.assistant import Notification
+from core.assistant import AssistantAttachment, AssistantResponse, Notification
 
 log = logging.getLogger(__name__)
 
@@ -187,14 +188,32 @@ class DiscordTransport(commands.Bot):
             )
         except Exception as exc:
             log.exception("Assistant error: %s", exc)
-            result = "I'm not available right now."
+            result = AssistantResponse(text="i'm not available right now.")
         if result:
-            await message.channel.send(result, reference=message if not is_dm else None)
+            text = result.text if isinstance(result, AssistantResponse) else str(result)
+            attachments = (
+                result.attachments if isinstance(result, AssistantResponse) else []
+            )
+            files = []
+            for attachment in attachments:
+                if not isinstance(attachment, AssistantAttachment):
+                    continue
+                buffer = io.BytesIO(attachment.content)
+                buffer.seek(0)
+                file_kwargs = {"filename": attachment.filename}
+                if attachment.description:
+                    file_kwargs["description"] = attachment.description
+                files.append(discord.File(buffer, **file_kwargs))
+            await message.channel.send(
+                content=text or None,
+                files=files or None,
+                reference=message if not is_dm else None,
+            )
             if not is_dm:
                 self._remember_channel_message(
                     channel_id,
                     str(self.user.id) if self.user else "bot",
-                    result,
+                    text,
                     True,
                 )
         await self._deliver_notifications()

@@ -1,4 +1,5 @@
 import asyncio
+import io
 import logging
 from typing import Optional
 
@@ -12,7 +13,7 @@ from telegram.ext import (
     filters,
 )
 
-from core.assistant import Notification
+from core.assistant import AssistantAttachment, AssistantResponse, Notification
 
 log = logging.getLogger(__name__)
 
@@ -81,9 +82,27 @@ class TelegramTransport:
             )
         except Exception as exc:
             log.exception("Assistant error: %s", exc)
-            result = "I'm not available right now."
+            result = AssistantResponse(text="i'm not available right now.")
         if result:
-            await message.reply_text(result)
+            text_payload = result.text if isinstance(result, AssistantResponse) else str(result)
+            attachments = (
+                result.attachments if isinstance(result, AssistantResponse) else []
+            )
+            if text_payload:
+                await message.reply_text(text_payload)
+            for attachment in attachments:
+                if not isinstance(attachment, AssistantAttachment):
+                    continue
+                buffer = io.BytesIO(attachment.content)
+                buffer.name = attachment.filename
+                if attachment.mime_type and attachment.mime_type.startswith("image/"):
+                    await message.reply_photo(photo=buffer, caption=None)
+                else:
+                    await message.reply_document(
+                        document=buffer,
+                        filename=attachment.filename,
+                        caption=attachment.description,
+                    )
         await self._deliver_notifications(context)
 
     async def assign_agenda(self, update: Update, context: ContextTypes.DEFAULT_TYPE):

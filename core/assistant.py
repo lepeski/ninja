@@ -1,16 +1,27 @@
+import asyncio
+import base64
 import hashlib
 import json
 import logging
+import math
 import re
 import sqlite3
 import time
 import uuid
 from collections import defaultdict, deque, OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Deque, Dict, Iterable, List, Optional, Tuple
 
+import aiohttp
 from openai import AsyncOpenAI
+
+try:  # Optional web3 dependency for wallet control
+    from eth_account import Account  # type: ignore
+    from web3 import Web3  # type: ignore
+except ImportError:  # pragma: no cover - handled gracefully at runtime
+    Account = None
+    Web3 = None
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +91,12 @@ MISSION_CODENAME_NOUNS = [
     "spire",
 ]
 
+GPT5_INPUT_COST_PER_1K = 0.02
+GPT5_OUTPUT_COST_PER_1K = 0.06
+GPT5_OFFER_EXPIRY_SECONDS = 300
+
+WALLET_COMMAND_PATTERN = re.compile(r"\[\[wallet:(\{.*?\})\]\]", re.DOTALL)
+
 
 @dataclass
 class MissionRecord:
@@ -131,6 +148,150 @@ class Notification:
     platform: str
     user_id: str
     message: str
+
+
+@dataclass
+class AssistantAttachment:
+    filename: str
+    content: bytes
+    mime_type: Optional[str] = None
+    description: Optional[str] = None
+
+
+@dataclass
+class AssistantResponse:
+    text: str = ""
+    attachments: List[AssistantAttachment] = field(default_factory=list)
+
+
+@dataclass
+class PendingGpt5Offer:
+    platform: str
+    user_id: str
+    conversation_id: str
+    original_message: str
+    reason: str
+    cost_estimate: float
+    price: float
+    history: List[Tuple[str, str]]
+    created_at: float
+
+
+class EvmWallet:
+    """Minimal EVM wallet helper for balance checks and transfers."""
+
+    def __init__(
+        self,
+        *,
+        rpc_url: Optional[str] = None,
+        private_key: Optional[str] = None,
+        address: Optional[str] = None,
+    ) -> None:
+        self.rpc_url = rpc_url
+        self._private_key = private_key
+        self._address_override = address
+        self._client: Optional[Web3] = None
+        self._account = None
+        if Web3 and rpc_url:
+            try:
+                self._client = Web3(Web3.HTTPProvider(rpc_url))
+            except Exception as exc:  # pragma: no cover - provider init failure is logged
+                log.warning("Failed to initialise Web3 provider: %s", exc)
+                self._client = None
+        if self._client and private_key and Account:
+            try:
+                self._account = Account.from_key(private_key)
+            except Exception as exc:  # pragma: no cover - invalid key
+                log.error("Invalid EVM private key: %s", exc)
+                self._account = None
+        self.address = None
+        if self._account:
+            self.address = self._account.address
+        elif address and self._client:
+            try:
+                self.address = self._client.to_checksum_address(address)
+            except Exception:
+                self.address = address
+        else:
+            self.address = address
+
+    @property
+    def available(self) -> bool:
+        return bool(self._client and self.address)
+
+    @property
+    def can_send(self) -> bool:
+        return bool(self.available and self._account and self._private_key)
+
+    @staticmethod
+    def _to_wei(client: Web3, value: float, unit: str):
+        if hasattr(client, "to_wei"):
+            return client.to_wei(value, unit)
+        return client.toWei(value, unit)  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _from_wei(client: Web3, value: int, unit: str) -> float:
+        if hasattr(client, "from_wei"):
+            return float(client.from_wei(value, unit))
+        return float(client.fromWei(value, unit))  # type: ignore[attr-defined]
+
+    async def get_balance_eth(self) -> Optional[float]:
+        if not self.available:
+            return None
+        client = self._client
+        address = self.address
+        assert client is not None and address is not None
+
+        def _get_balance() -> float:
+            balance_wei = client.eth.get_balance(address)
+            return self._from_wei(client, balance_wei, "ether")
+
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(None, _get_balance)
+        except Exception as exc:  # pragma: no cover - rpc failures logged
+            log.warning("Failed to fetch wallet balance: %s", exc)
+            return None
+
+    async def send_eth(
+        self,
+        *,
+        to_address: str,
+        amount_eth: float,
+        gas_price_gwei: Optional[float] = None,
+    ) -> Optional[str]:
+        if not self.can_send:
+            raise RuntimeError("Wallet not configured for sending funds")
+        client = self._client
+        account = self._account
+        assert client is not None and account is not None
+        to_checksum = client.to_checksum_address(to_address)
+
+        def _send() -> str:
+            nonce = client.eth.get_transaction_count(account.address)
+            gas_price = None
+            if gas_price_gwei is not None:
+                gas_price = self._to_wei(client, gas_price_gwei, "gwei")
+            else:
+                gas_price = client.eth.gas_price
+            tx = {
+                "to": to_checksum,
+                "value": self._to_wei(client, amount_eth, "ether"),
+                "gas": 21000,
+                "gasPrice": gas_price,
+                "nonce": nonce,
+                "chainId": client.eth.chain_id,
+            }
+            signed = account.sign_transaction(tx)
+            tx_hash = client.eth.send_raw_transaction(signed.rawTransaction)
+            return tx_hash.hex()
+
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(None, _send)
+        except Exception as exc:  # pragma: no cover - transaction issues logged
+            log.error("Failed to send transaction: %s", exc)
+            return None
 
 
 class MemoryStore:
@@ -224,6 +385,15 @@ class MemoryStore:
             return False
         others = {item for item in bucket if item != str(user_id)}
         return bool(others)
+
+    def resolve_alias(self, platform: str, alias: str) -> List[str]:
+        normalized = self._normalize_alias(alias)
+        if not normalized:
+            return []
+        bucket = self._alias_index.get((platform, normalized))
+        if not bucket:
+            return []
+        return list(bucket)
 
     def _nickname_signature(self, profile: dict) -> str:
         bio = profile.get("bio") or {}
@@ -832,13 +1002,25 @@ class Assistant:
         model: str,
         mem_dir: str = "mem",
         memory_db: str = "memory.db",
+        wallet_address: Optional[str] = None,
+        wallet_private_key: Optional[str] = None,
+        evm_rpc_url: Optional[str] = None,
     ):
         self.client = AsyncOpenAI(api_key=openai_api_key)
         self.model = model
+        self.gpt5_model = "gpt-5"
         self.memory = MemoryStore(memory_db, Path(mem_dir))
         self.missions = MissionStore(self.memory.conn)
         self.persona_prompt = self._build_persona_prompt()
         self._pending_notifications: List[Notification] = []
+        self._pending_gpt5_offers: Dict[Tuple[str, str], PendingGpt5Offer] = {}
+        self.wallet: Optional[EvmWallet] = None
+        if evm_rpc_url and (wallet_private_key or wallet_address):
+            self.wallet = EvmWallet(
+                rpc_url=evm_rpc_url,
+                private_key=wallet_private_key,
+                address=wallet_address,
+            )
 
     def _build_persona_prompt(self) -> str:
         return (
@@ -864,7 +1046,7 @@ class Assistant:
         username: Optional[str] = None,
         channel_id: Optional[str] = None,
         is_dm: bool = False,
-    ) -> Optional[str]:
+    ) -> Optional[AssistantResponse]:
         if not message:
             return None
         trimmed = message.strip()
@@ -875,6 +1057,7 @@ class Assistant:
                 platform, user_id, username or user_id, trimmed
             )
         self._process_timeouts(platform)
+        self._expire_gpt5_offers()
         conversation_id = channel_id or user_id
         profile = self.memory.recall(platform, user_id)
         display_name = self.memory.display_name(
@@ -888,6 +1071,161 @@ class Assistant:
         owner_missions = self.missions.get_active_for_creator(platform, user_id)
         target_missions = self.missions.get_active_for_target(platform, user_id)
         history = self.memory.get_history(platform, conversation_id)
+
+        offer_key = (platform, user_id)
+        pending_offer = self._pending_gpt5_offers.get(offer_key)
+        if pending_offer:
+            decision = self._classify_gpt5_decision(trimmed)
+            if decision in {"accept", "decline"}:
+                self._pending_gpt5_offers.pop(offer_key, None)
+                self.memory.log_history(
+                    platform,
+                    conversation_id,
+                    "user",
+                    trimmed,
+                    speaker=display_name,
+                    speaker_user_id=user_id,
+                )
+                if decision == "decline":
+                    reply_text = "noted. staying put."
+                    self.memory.log_history(
+                        platform,
+                        conversation_id,
+                        "assistant",
+                        reply_text,
+                        speaker="assistant",
+                    )
+                    self._log_mission_exchange(
+                        platform=platform,
+                        user_id=user_id,
+                        username=display_name,
+                        owner_missions=owner_missions,
+                        target_missions=target_missions,
+                        user_message=trimmed,
+                        assistant_reply=reply_text,
+                    )
+                    await self._extract_memories(
+                        platform=platform,
+                        user_id=user_id,
+                        username=display_name,
+                        last_user=trimmed,
+                        last_reply=reply_text,
+                        profile=profile,
+                    )
+                    await self._evaluate_missions_for_user(
+                        platform=platform,
+                        user_id=user_id,
+                        target_missions=target_missions,
+                    )
+                    return AssistantResponse(text=reply_text)
+                gpt5_reply = await self._execute_gpt5(pending_offer, username=display_name)
+                reply_text = gpt5_reply.text
+                wallet_command, cleaned = self._extract_wallet_directive(reply_text)
+                wallet_note = None
+                if wallet_command:
+                    reply_text = cleaned
+                    wallet_note = await self._execute_wallet_command(wallet_command)
+                if wallet_note:
+                    reply_text = f"{reply_text}\n{wallet_note}".strip() if reply_text else wallet_note
+                if reply_text:
+                    self.memory.log_history(
+                        platform,
+                        conversation_id,
+                        "assistant",
+                        reply_text,
+                        speaker="assistant",
+                    )
+                gpt5_reply = AssistantResponse(text=reply_text, attachments=gpt5_reply.attachments)
+                self._log_mission_exchange(
+                    platform=platform,
+                    user_id=user_id,
+                    username=display_name,
+                    owner_missions=owner_missions,
+                    target_missions=target_missions,
+                    user_message=trimmed,
+                    assistant_reply=reply_text,
+                )
+                await self._extract_memories(
+                    platform=platform,
+                    user_id=user_id,
+                    username=display_name,
+                    last_user=trimmed,
+                    last_reply=reply_text,
+                    profile=profile,
+                )
+                await self._evaluate_missions_for_user(
+                    platform=platform,
+                    user_id=user_id,
+                    target_missions=target_missions,
+                )
+                return gpt5_reply
+
+        mission_response: Optional[AssistantResponse] = None
+        if self.memory.is_known(platform, user_id):
+            mission_response = await self._maybe_handle_conversational_assignment(
+                platform=platform,
+                creator_user_id=user_id,
+                conversation_id=conversation_id,
+                display_name=display_name,
+                message=trimmed,
+                participants=participants,
+            )
+        if mission_response is not None:
+            reply_text = mission_response.text
+            wallet_command, cleaned = self._extract_wallet_directive(reply_text)
+            wallet_note = None
+            if wallet_command:
+                reply_text = cleaned
+                wallet_note = await self._execute_wallet_command(wallet_command)
+            if wallet_note:
+                reply_text = f"{reply_text}\n{wallet_note}".strip() if reply_text else wallet_note
+            if wallet_command or wallet_note:
+                mission_response = AssistantResponse(
+                    text=reply_text,
+                    attachments=mission_response.attachments,
+                )
+            self.memory.log_history(
+                platform,
+                conversation_id,
+                "user",
+                trimmed,
+                speaker=display_name,
+                speaker_user_id=user_id,
+            )
+            if reply_text:
+                self.memory.log_history(
+                    platform,
+                    conversation_id,
+                    "assistant",
+                    reply_text,
+                    speaker="assistant",
+                )
+            owner_missions = self.missions.get_active_for_creator(platform, user_id)
+            target_missions = self.missions.get_active_for_target(platform, user_id)
+            self._log_mission_exchange(
+                platform=platform,
+                user_id=user_id,
+                username=display_name,
+                owner_missions=owner_missions,
+                target_missions=target_missions,
+                user_message=trimmed,
+                assistant_reply=reply_text,
+            )
+            await self._extract_memories(
+                platform=platform,
+                user_id=user_id,
+                username=display_name,
+                last_user=trimmed,
+                last_reply=reply_text,
+                profile=profile,
+            )
+            await self._evaluate_missions_for_user(
+                platform=platform,
+                user_id=user_id,
+                target_missions=target_missions,
+            )
+            return mission_response
+
         system_prompt = self._compose_system_prompt(
             username=display_name,
             profile=profile,
@@ -912,8 +1250,27 @@ class Assistant:
             )
         except Exception as exc:
             log.exception("OpenAI chat failure: %s", exc)
-            return "I'm offline for a moment."
+            return AssistantResponse(text="i'm offline for a moment.")
         reply = response.choices[0].message.content or ""
+        history_snapshot = list(history[-6:]) if history else []
+        history_snapshot.append(("user", trimmed))
+        offer_line = await self._maybe_prepare_gpt5_offer(
+            platform=platform,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            user_message=trimmed,
+            assistant_reply=reply,
+            history_snapshot=history_snapshot,
+        )
+        if offer_line:
+            reply = f"{reply}\n{offer_line}" if reply else offer_line
+        wallet_command, cleaned_reply = self._extract_wallet_directive(reply)
+        wallet_note = None
+        if wallet_command:
+            reply = cleaned_reply
+            wallet_note = await self._execute_wallet_command(wallet_command)
+        if wallet_note:
+            reply = f"{reply}\n{wallet_note}".strip() if reply else wallet_note
         self.memory.log_history(
             platform,
             conversation_id,
@@ -952,7 +1309,416 @@ class Assistant:
             user_id=user_id,
             target_missions=target_missions,
         )
-        return reply
+        return AssistantResponse(text=reply)
+
+    def _expire_gpt5_offers(self) -> None:
+        if not self._pending_gpt5_offers:
+            return
+        now = time.time()
+        stale = [
+            key
+            for key, offer in self._pending_gpt5_offers.items()
+            if now - offer.created_at > GPT5_OFFER_EXPIRY_SECONDS
+        ]
+        for key in stale:
+            self._pending_gpt5_offers.pop(key, None)
+
+    def _classify_gpt5_decision(self, message: str) -> str:
+        lowered = (message or "").strip().lower()
+        if not lowered or len(lowered) > 48:
+            return "unknown"
+        cleaned = re.sub(r"[^a-z\s]", "", lowered)
+        accept_tokens = {
+            "yes",
+            "y",
+            "do it",
+            "go",
+            "go ahead",
+            "run it",
+            "send it",
+            "proceed",
+            "confirm",
+            "ok",
+            "okay",
+            "sure",
+        }
+        decline_tokens = {
+            "no",
+            "n",
+            "no thanks",
+            "nah",
+            "not now",
+            "stop",
+            "cancel",
+            "don't",
+            "do not",
+            "pass",
+        }
+        if cleaned in accept_tokens or lowered in accept_tokens:
+            return "accept"
+        if cleaned in decline_tokens or lowered in decline_tokens:
+            return "decline"
+        return "unknown"
+
+    def _extract_wallet_directive(self, reply: str) -> Tuple[Optional[dict], str]:
+        if not reply:
+            return None, reply
+        matches = list(WALLET_COMMAND_PATTERN.finditer(reply))
+        if not matches:
+            return None, reply
+        payload_raw = matches[-1].group(1)
+        try:
+            command = json.loads(payload_raw)
+        except json.JSONDecodeError:
+            command = None
+        cleaned = WALLET_COMMAND_PATTERN.sub("", reply).strip()
+        return command, cleaned
+
+    async def _execute_wallet_command(self, command: Optional[dict]) -> Optional[str]:
+        if not command:
+            return None
+        action = str(command.get("action") or "").lower()
+        if not self.wallet or not self.wallet.available:
+            return "wallet offline."
+        if action == "balance":
+            balance = await self.wallet.get_balance_eth()
+            if balance is None:
+                return "wallet offline."
+            return f"balance {balance:.4f} eth"
+        if action == "send":
+            if not self.wallet.can_send:
+                return "send locked."
+            to_address = command.get("to") or command.get("address")
+            amount_val = command.get("amount_eth") or command.get("amount")
+            gas_price_val = command.get("gas_price_gwei") or command.get("gas_price")
+            if not to_address or amount_val is None:
+                return "send data incomplete."
+            try:
+                amount = float(amount_val)
+            except (TypeError, ValueError):
+                return "send amount invalid."
+            gas_price = None
+            if gas_price_val is not None:
+                try:
+                    gas_price = float(gas_price_val)
+                except (TypeError, ValueError):
+                    gas_price = None
+            tx_hash = await self.wallet.send_eth(
+                to_address=str(to_address),
+                amount_eth=amount,
+                gas_price_gwei=gas_price,
+            )
+            if not tx_hash:
+                return "send failed."
+            short_to = str(to_address)
+            if len(short_to) > 12:
+                short_to = f"{short_to[:6]}…{short_to[-4:]}"
+            log.info("Wallet sent %.6f ETH to %s (tx=%s)", amount, to_address, tx_hash)
+            return f"sent {amount:.4f} eth -> {short_to}"
+        if action:
+            return "wallet action unknown."
+        return None
+
+    async def _maybe_prepare_gpt5_offer(
+        self,
+        *,
+        platform: str,
+        user_id: str,
+        conversation_id: str,
+        user_message: str,
+        assistant_reply: str,
+        history_snapshot: List[Tuple[str, str]],
+    ) -> Optional[str]:
+        offer_key = (platform, user_id)
+        if self._pending_gpt5_offers.get(offer_key):
+            return None
+        if len(user_message.split()) < 20 and len(user_message) < 160:
+            return None
+        assessment = await self._assess_gpt5_offer(
+            user_message=user_message,
+            assistant_reply=assistant_reply,
+            history_snapshot=history_snapshot,
+        )
+        if not assessment or not assessment.get("needs_upgrade"):
+            return None
+        input_tokens = int(assessment.get("estimated_input_tokens") or 0)
+        output_tokens = int(assessment.get("estimated_output_tokens") or 0)
+        cost_estimate = self._estimate_gpt5_cost(input_tokens, output_tokens)
+        if cost_estimate <= 0:
+            cost_estimate = 0.25
+        if cost_estimate <= 1:
+            price = 1.0
+        else:
+            price = cost_estimate * 10
+        price = math.ceil(price * 100) / 100.0
+        reason = str(assessment.get("reason") or "detailed task")
+        history_for_offer = list(history_snapshot)
+        history_for_offer.append(("assistant", assistant_reply))
+        self._pending_gpt5_offers[offer_key] = PendingGpt5Offer(
+            platform=platform,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            original_message=user_message,
+            reason=reason,
+            cost_estimate=cost_estimate,
+            price=price,
+            history=history_for_offer[-8:],
+            created_at=time.time(),
+        )
+        price_text = f"${price:.2f}".rstrip("0").rstrip(".")
+        return f"gpt5 rerun {price_text}. say yes to confirm."
+
+    async def _assess_gpt5_offer(
+        self,
+        *,
+        user_message: str,
+        assistant_reply: str,
+        history_snapshot: List[Tuple[str, str]],
+    ) -> Optional[dict]:
+        condensed_history = history_snapshot[-6:]
+        system_prompt = (
+            "Judge if the request needs an upgraded model."
+            "Respond in JSON with keys needs_upgrade (bool), reason (string),"
+            " estimated_input_tokens (int), estimated_output_tokens (int)."
+            "Focus on complexity, ambiguity, and research depth."
+        )
+        payload = {
+            "user_message": user_message,
+            "assistant_reply": assistant_reply,
+            "history": condensed_history,
+        }
+        prompt = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False),
+            },
+        ]
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=prompt,
+                temperature=0,
+            )
+        except Exception as exc:
+            log.debug("gpt5 offer assessment failed: %s", exc)
+            return None
+        raw = response.choices[0].message.content or "{}"
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            log.debug("gpt5 offer assessment parse error: %s", raw)
+            return None
+        if not isinstance(data, dict):
+            return None
+        data["needs_upgrade"] = bool(data.get("needs_upgrade"))
+        return data
+
+    def _estimate_gpt5_cost(self, input_tokens: int, output_tokens: int) -> float:
+        cost = (
+            (max(input_tokens, 0) / 1000.0) * GPT5_INPUT_COST_PER_1K
+            + (max(output_tokens, 0) / 1000.0) * GPT5_OUTPUT_COST_PER_1K
+        )
+        return round(cost, 4)
+
+    async def _execute_gpt5(
+        self, offer: PendingGpt5Offer, *, username: str
+    ) -> AssistantResponse:
+        system_prompt = (
+            "You are gpt-5. Provide a precise, thorough answer in JSON."
+            "Format: {\"answer\": str, \"attachments\": [ {\"filename\": str,"
+            " \"mime_type\": str, \"data\": base64? or \"url\": str, \"description\": str } ] }."
+            "Keep answer concise yet complete."
+        )
+        payload = {
+            "username": username,
+            "reason": offer.reason,
+            "original_message": offer.original_message,
+            "history": offer.history,
+        }
+        prompt = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False),
+            },
+        ]
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.gpt5_model,
+                messages=prompt,
+                temperature=0.4,
+                top_p=0.9,
+            )
+        except Exception as exc:
+            log.exception("gpt-5 execution failed: %s", exc)
+            return AssistantResponse(text="gpt5 run failed. stay here.")
+        raw = response.choices[0].message.content or "{}"
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = {"answer": raw}
+        answer = str(data.get("answer") or "").strip()
+        attachments_payload = data.get("attachments") or []
+        attachments: List[AssistantAttachment] = []
+        if isinstance(attachments_payload, list):
+            for item in attachments_payload:
+                if not isinstance(item, dict):
+                    continue
+                filename = item.get("filename") or f"gpt5-{uuid.uuid4().hex}.bin"
+                mime_type = item.get("mime_type")
+                description = item.get("description")
+                content: Optional[bytes] = None
+                if item.get("data"):
+                    try:
+                        content = base64.b64decode(item["data"], validate=True)
+                    except (ValueError, TypeError):
+                        content = None
+                elif item.get("url"):
+                    content = await self._fetch_remote_asset(item["url"])
+                if content:
+                    attachments.append(
+                        AssistantAttachment(
+                            filename=filename,
+                            content=content,
+                            mime_type=mime_type,
+                            description=description,
+                        )
+                    )
+        if not answer:
+            answer = "no content returned."
+        price_text = f"${offer.price:.2f}".rstrip("0").rstrip(".")
+        final_text = f"gpt5 {price_text}. {answer}".strip()
+        return AssistantResponse(text=final_text, attachments=attachments)
+
+    async def _fetch_remote_asset(self, url: str) -> Optional[bytes]:
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        return await resp.read()
+        except Exception as exc:
+            log.debug("asset fetch failed for %s: %s", url, exc)
+        return None
+
+    async def _maybe_handle_conversational_assignment(
+        self,
+        *,
+        platform: str,
+        creator_user_id: str,
+        conversation_id: str,
+        display_name: str,
+        message: str,
+        participants: Dict[Tuple[str, str], str],
+    ) -> Optional[AssistantResponse]:
+        detection = await self._detect_mission_assignment(
+            platform=platform,
+            creator_user_id=creator_user_id,
+            message=message,
+            participants=participants,
+        )
+        if not detection or not detection.get("assign"):
+            return None
+        raw_target_id = detection.get("target_user_id")
+        target_user_id: Optional[str] = None
+        if raw_target_id:
+            if isinstance(raw_target_id, str) and ":" in raw_target_id:
+                target_platform, target_id_only = self._split_key(raw_target_id)
+            else:
+                target_platform, target_id_only = platform, str(raw_target_id)
+            if target_platform == platform:
+                target_user_id = target_id_only
+        target_alias = detection.get("target_alias")
+        timeout_hours = detection.get("timeout_hours")
+        if timeout_hours is not None:
+            try:
+                timeout_hours = float(timeout_hours)
+            except (TypeError, ValueError):
+                timeout_hours = None
+        if not target_user_id and target_alias:
+            matches = self.memory.resolve_alias(platform, target_alias)
+            if len(matches) == 1:
+                target_user_id = matches[0]
+        if not target_user_id:
+            reason = detection.get("reason") or "need target alias"
+            return AssistantResponse(text=f"need target alias. {reason}".strip())
+        objective = detection.get("objective") or message
+        target_key = f"{platform}:{target_user_id}"
+        try:
+            mission, ack, intro = await self.start_mission(
+                creator_id=f"{platform}:{creator_user_id}",
+                target_id=target_key,
+                objective=objective,
+                timeout_hours=timeout_hours,
+                creator_name=display_name,
+                target_name=detection.get("target_name") or target_alias,
+            )
+        except PermissionError as exc:
+            return AssistantResponse(text=str(exc))
+        except Exception as exc:
+            log.exception("mission assignment via chat failed: %s", exc)
+            return AssistantResponse(text="mission failed. try again later.")
+        self._pending_notifications.append(
+            Notification(platform=mission.platform, user_id=mission.target_user_id, message=intro)
+        )
+        return AssistantResponse(text=ack)
+
+    async def _detect_mission_assignment(
+        self,
+        *,
+        platform: str,
+        creator_user_id: str,
+        message: str,
+        participants: Dict[Tuple[str, str], str],
+    ) -> Optional[dict]:
+        system_prompt = (
+            "Review the message and decide if it asks to assign a mission/agenda."
+            "Respond JSON with keys: assign (bool), objective (str), target_user_id (str),"
+            " target_alias (str), target_name (str), timeout_hours (float|None), reason (str)."
+            "If referencing a listed participant, return their user_id in platform:user format."
+            "If unsure, assign=false."
+        )
+        participant_list = [
+            {
+                "platform": p,
+                "user_id": u,
+                "label": label,
+            }
+            for (p, u), label in participants.items()
+        ]
+        payload = {
+            "platform": platform,
+            "creator_user_id": creator_user_id,
+            "message": message,
+            "participants": participant_list,
+        }
+        prompt = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False),
+            },
+        ]
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=prompt,
+                temperature=0,
+            )
+        except Exception as exc:
+            log.debug("mission detection failed: %s", exc)
+            return None
+        raw = response.choices[0].message.content or "{}"
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            log.debug("mission detection parse error: %s", raw)
+            return None
+        if not isinstance(data, dict):
+            return None
+        data["assign"] = bool(data.get("assign"))
+        return data
 
     async def observe_message(
         self,
@@ -1185,6 +1951,19 @@ class Assistant:
                     for token in sorted(placeholder_tokens)
                 )
             )
+
+        if self.wallet and self.wallet.address:
+            prompt_parts.append(f"wallet_address: {self.wallet.address}")
+            if self.wallet.can_send:
+                prompt_parts.append(
+                    "wallet_ops: share address on request. only send when fast upside is credible."
+                    " encode transfers with [[wallet:{\"action\":\"send\",\"to\":\"0x...\",\"amount_eth\":value}]]"
+                    " and balance checks with [[wallet:{\"action\":\"balance\"}]]."
+                )
+            else:
+                prompt_parts.append(
+                    "wallet_ops: share address on request. outbound transfers disabled (no private key)."
+                )
 
         return "\n".join(prompt_parts)
 
