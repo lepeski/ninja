@@ -20,6 +20,36 @@ MEMORY_NOTES_LIMIT = 50
 MEMORY_SNIPPET_LIMIT = 10
 UNKNOWN_ALIAS = "nigel inca gang gang adam"
 
+NICKNAME_DESCRIPTORS = [
+    "wry",
+    "sly",
+    "calm",
+    "odd",
+    "sharp",
+    "soft",
+    "brisk",
+    "mirth",
+    "quiet",
+    "zesty",
+    "arcane",
+    "lunar",
+]
+
+NICKNAME_PERSONAS = [
+    "sparrow",
+    "otter",
+    "fox",
+    "owl",
+    "badger",
+    "scribe",
+    "riddle",
+    "ember",
+    "drifter",
+    "jester",
+    "sage",
+    "phantom",
+]
+
 MISSION_CODENAME_ADJECTIVES = [
     "ashen",
     "silent",
@@ -195,6 +225,68 @@ class MemoryStore:
         others = {item for item in bucket if item != str(user_id)}
         return bool(others)
 
+    def _nickname_signature(self, profile: dict) -> str:
+        bio = profile.get("bio") or {}
+        summary = (bio.get("summary") or "").strip().lower()
+        traits = [str(item).strip().lower() for item in bio.get("traits", []) if item]
+        facts = bio.get("facts") or {}
+        fact_bits = []
+        for key in sorted(facts.keys())[:4]:
+            value = str(facts.get(key) or "").strip().lower()
+            if not value:
+                continue
+            fact_bits.append(f"{key}:{value}")
+        relationships = bio.get("relationships") or {}
+        relation_bits = []
+        for key in sorted(relationships.keys())[:3]:
+            relation_bits.append(f"{key}:{relationships[key]}")
+        core = "|".join(
+            filter(
+                None,
+                [
+                    profile.get("platform"),
+                    str(profile.get("user_id")),
+                    summary,
+                    "|".join(traits[:4]),
+                    "|".join(fact_bits),
+                    "|".join(relation_bits),
+                ],
+            )
+        )
+        if not core:
+            core = str(profile.get("user_id"))
+        digest = hashlib.sha1(core.encode("utf-8")).hexdigest()
+        return digest
+
+    def _generate_nickname(self, profile: dict, signature: str) -> str:
+        bio = profile.get("bio") or {}
+        summary_words = re.findall(r"[a-zA-Z]{3,}", (bio.get("summary") or ""))
+        traits = [str(item).strip().lower() for item in bio.get("traits", []) if item]
+        seeds: List[str] = []
+        for bucket in (traits, summary_words):
+            for item in bucket:
+                lower = item.lower()
+                if lower and lower not in seeds:
+                    seeds.append(lower)
+        seed_index = int(signature[:6], 16)
+        descriptor: str
+        if seeds:
+            descriptor = seeds[seed_index % len(seeds)][:8]
+        else:
+            descriptor = NICKNAME_DESCRIPTORS[seed_index % len(NICKNAME_DESCRIPTORS)]
+        persona = NICKNAME_PERSONAS[seed_index % len(NICKNAME_PERSONAS)]
+        nickname = f"{descriptor}-{persona}".lower()
+        return nickname
+
+    def _refresh_nickname(self, profile: dict) -> None:
+        signature = self._nickname_signature(profile)
+        current = str(profile.get("nickname") or "").strip()
+        current_sig = str(profile.get("nickname_signature") or "")
+        if current and current_sig == signature:
+            return
+        profile["nickname"] = self._generate_nickname(profile, signature)
+        profile["nickname_signature"] = signature
+
     def identity_blurb(
         self, platform: str, user_id: str, fallback: Optional[str] = None
     ) -> str:
@@ -237,6 +329,8 @@ class MemoryStore:
             "platform": platform,
             "user_id": user_id,
             "alias": "",
+            "nickname": "",
+            "nickname_signature": "",
             "preferences": {},
             "facts": {},
             "personality": [],
@@ -264,6 +358,9 @@ class MemoryStore:
         profile.setdefault("personality", [])
         profile.setdefault("notes", [])
         profile.setdefault("bio", self._empty_bio())
+        profile.setdefault("platform", platform)
+        profile.setdefault("nickname", "")
+        profile.setdefault("nickname_signature", "")
         profile["last_seen"] = time.time()
         self._save(platform, user_id, profile)
         return profile
@@ -275,6 +372,9 @@ class MemoryStore:
         payload.setdefault("personality", [])
         payload.setdefault("notes", [])
         payload.setdefault("bio", self._empty_bio())
+        payload.setdefault("platform", platform)
+        payload.setdefault("nickname", "")
+        payload.setdefault("nickname_signature", "")
         with self.conn:
             self.conn.execute(
                 """
@@ -309,6 +409,7 @@ class MemoryStore:
         profile = self.recall(platform, user_id)
         normalized_key = str(key or "").strip().lower()
         normalized_value = str(value or "").strip()
+        nickname_trigger = False
         if category == "preferences":
             profile.setdefault("preferences", {})[key] = value
         elif category == "facts":
@@ -320,6 +421,8 @@ class MemoryStore:
         else:
             notes = profile.setdefault("notes", [])
             notes.append({"key": key, "value": value, "ts": time.time()})
+            if len(notes) > MEMORY_NOTES_LIMIT:
+                nickname_trigger = True
             profile["notes"] = notes[-MEMORY_NOTES_LIMIT:]
         if (
             normalized_value
@@ -327,6 +430,10 @@ class MemoryStore:
             and normalized_key in {"alias", "name", "callsign", "handle"}
         ):
             profile["alias"] = normalized_value
+        if nickname_trigger or (
+            not profile.get("nickname") and profile.get("bio", {}).get("summary")
+        ):
+            self._refresh_nickname(profile)
         self._save(platform, user_id, profile)
 
     def update_bio(self, platform: str, user_id: str, bio_update: dict) -> None:
@@ -393,6 +500,7 @@ class MemoryStore:
 
         if changed:
             profile["bio"] = bio
+            self._refresh_nickname(profile)
             self._save(platform, user_id, profile)
 
     def is_known(self, platform: str, user_id: str) -> bool:
@@ -739,8 +847,9 @@ class Assistant:
             " never add speaker tags. guard privacy."
             " when a name shows as (no-alias-rule:xyz), swap it for the fixed 5-letter acronym from 'Nigel Inca Gang Gang Adam' (nigga)."
             " weave that acronym near reply endings when space allows until the user shares a name."
-            " never invent alternate callsigns." 
+            " never invent alternate callsigns."
             " never repeat the placeholder or 'unknown alias'."
+            " stored nicknames are playful intel; use them only when the mood is light and it adds a sly wink."
         )
 
     async def close(self) -> None:
@@ -937,6 +1046,9 @@ class Assistant:
             add_memory_bit(f"biofact {key}={value}")
         for trait in (bio.get("traits") or [])[:3]:
             add_memory_bit(f"biotrait {trait}")
+        nickname = str(profile.get("nickname") or "").strip()
+        if nickname:
+            add_memory_bit(f"nickname {nickname}")
         if not memory_bits:
             memory_bits.append("no saved context")
 
@@ -1042,6 +1154,11 @@ class Assistant:
             "memory: " + " | ".join(memory_bits),
             "guidance: " + " | ".join(role_guidance),
         ]
+
+        if nickname:
+            prompt_parts.append(
+                f"nickname_use: {nickname} -> playful only when room mood is light; otherwise keep it holstered"
+            )
 
         if owner_lines:
             prompt_parts.append("creator_missions: " + " | ".join(owner_lines))
