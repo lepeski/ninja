@@ -1,5 +1,6 @@
 import io
 import logging
+import re
 from collections import defaultdict, deque
 from typing import Dict, List, Optional
 
@@ -24,7 +25,7 @@ def should_bot_reply(message: discord.Message, recent_messages: List[Dict], bot_
     bot_id = bot_user.id if bot_user else None
 
     # Signal A: direct summons or command prefixes.
-    if lowered.startswith("ninja"):
+    if re.search(r"\bninja\b", lowered):
         return True
     if stripped.startswith("!"):
         return True
@@ -248,8 +249,9 @@ class DiscordTransport(commands.Bot):
     def _strip_direct_invocation(self, content: str, message: discord.Message) -> str:
         stripped = content.strip()
         lowered = stripped.lower()
-        if lowered.startswith("ninja"):
-            trimmed = stripped[len("ninja") :].lstrip(" ,:;-\t")
+        if re.search(r"\bninja\b", lowered):
+            cleaned = re.sub(r"(?i)\bninja\b", "", stripped, count=1)
+            trimmed = cleaned.strip(" ,:;-\t")
             return trimmed or "ninja"
         if stripped.startswith(self._primary_prefix):
             trimmed = stripped[len(self._primary_prefix) :].lstrip()

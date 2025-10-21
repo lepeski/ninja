@@ -12,6 +12,7 @@ Ninja is a shared conversational brain that powers both Discord and Telegram. A 
 - **Selective group awareness** – Discord group replies trigger on summons, implicit questions, or recent-thread follow-ups while idle chatter is ignored.
 - **Inbox archiving** – First-contact private messages are archived in `mem/inbox/` before the assistant replies.
 - **GPT-5 upgrades + wallet** – The agent can upsell complex jobs to GPT-5, quote costs, accept payment, and track an on-chain wallet for payouts or fast opportunistic sends.
+- **Hidden lore** – Curious operators can probe the Cyberhood backstory, the forest refuge, and the crystal hunt in short, cryptic fragments.
 
 ## Requirements
 
@@ -37,7 +38,7 @@ pip install -r requirements.txt
    - `OPENAI_API_KEY`
    - `DISCORD_TOKEN`
    - `TELEGRAM_TOKEN`
-   - Optional overrides: `MODEL` (defaults to `gpt-4.1`), `MEM_DIR`, `DISCORD_GUILD_ID`, `EVM_RPC_URL`, `EVM_WALLET_ADDRESS`, `EVM_WALLET_PRIVATE_KEY`
+   - Optional overrides: `MODEL` (defaults to `gpt-4.1`), `GPT5_MODEL`, `MEM_DIR`, `DISCORD_GUILD_ID`, `EVM_RPC_URL`, `EVM_WALLET_ADDRESS`, `EVM_WALLET_PRIVATE_KEY`
 3. Ensure the `mem/` directory remains writable (it is created automatically on first run).
 
 ## Running

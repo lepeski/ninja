@@ -1,6 +1,7 @@
 import asyncio
 import io
 import logging
+import re
 from typing import Optional
 
 from telegram import Update
@@ -46,11 +47,9 @@ class TelegramTransport:
         if not triggered:
             stripped = text.strip()
             lowered = stripped.lower()
-            if lowered.startswith("ninja"):
+            if re.search(r"\bninja\b", lowered):
                 triggered = True
-                stripped = stripped[len("ninja") :].lstrip(" ,:;-\t")
-                if not stripped:
-                    stripped = "ninja"
+                stripped = re.sub(r"(?i)\bninja\b", "", stripped, count=1).strip(" ,:;-\t") or "ninja"
             else:
                 bot_username = (context.bot.username or "").lower() if context.bot else ""
                 mention_prefix = f"@{bot_username}" if bot_username else ""

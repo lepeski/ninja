@@ -31,6 +31,125 @@ MEMORY_NOTES_LIMIT = 50
 MEMORY_SNIPPET_LIMIT = 10
 UNKNOWN_ALIAS = "nigel inca gang gang adam"
 
+MISSION_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "but",
+    "with",
+    "for",
+    "from",
+    "into",
+    "in",
+    "on",
+    "at",
+    "by",
+    "about",
+    "this",
+    "that",
+    "these",
+    "those",
+    "their",
+    "your",
+    "yours",
+    "ours",
+    "mine",
+    "have",
+    "has",
+    "had",
+    "make",
+    "should",
+    "could",
+    "would",
+    "please",
+    "maybe",
+    "also",
+    "just",
+    "like",
+    "out",
+    "up",
+    "down",
+    "more",
+    "less",
+    "than",
+    "then",
+    "before",
+    "after",
+    "tell",
+    "many",
+    "much",
+    "type",
+    "kind",
+    "name",
+    "names",
+    "what",
+    "who",
+    "how",
+    "why",
+    "when",
+    "where",
+    "if",
+    "is",
+    "are",
+    "be",
+    "been",
+    "am",
+    "do",
+    "does",
+    "did",
+    "now",
+    "rn",
+    "right",
+    "going",
+    "gonna",
+    "someone",
+    "somebody",
+    "anyone",
+    "anything",
+    "thing",
+    "things",
+    "else",
+    "coin",
+    "coins",
+    "mission",
+    "task",
+    "goal",
+    "target",
+    "give",
+}
+
+MISSION_VERB_SYNONYMS = {
+    "find": "seek",
+    "get": "gather",
+    "learn": "study",
+    "know": "verify",
+    "check": "probe",
+    "count": "tally",
+    "discover": "uncover",
+    "trace": "trace",
+    "confirm": "confirm",
+    "locate": "locate",
+    "buy": "acquire",
+    "acquire": "acquire",
+    "track": "track",
+    "observe": "observe",
+    "watch": "watch",
+    "report": "report",
+    "investigate": "investigate",
+    "figure": "decode",
+}
+
+MISSION_FALLBACK_SUFFIXES = [
+    "redux",
+    "encore",
+    "afterglow",
+    "echo",
+    "revive",
+    "trace",
+]
+
 NICKNAME_DESCRIPTORS = [
     "wry",
     "sly",
@@ -59,36 +178,6 @@ NICKNAME_PERSONAS = [
     "jester",
     "sage",
     "phantom",
-]
-
-MISSION_CODENAME_ADJECTIVES = [
-    "ashen",
-    "silent",
-    "jade",
-    "obsidian",
-    "scarlet",
-    "lunar",
-    "ember",
-    "feral",
-    "hidden",
-    "sable",
-    "cobalt",
-    "velvet",
-]
-
-MISSION_CODENAME_NOUNS = [
-    "whisper",
-    "talon",
-    "cipher",
-    "veil",
-    "echo",
-    "shadow",
-    "relic",
-    "signal",
-    "lotus",
-    "ember",
-    "mirage",
-    "spire",
 ]
 
 GPT5_INPUT_COST_PER_1K = 0.02
@@ -824,28 +913,81 @@ class MissionStore:
         return row is not None
 
     def _generate_codename(self, objective: str) -> str:
-        base_seed = f"{objective}|{time.time()}|{uuid.uuid4().hex}"
-        digest = hashlib.sha1(base_seed.encode("utf-8")).digest()
-        length = len(digest)
-        for attempt in range(12):
-            idx = attempt % length
-            adj = MISSION_CODENAME_ADJECTIVES[
-                digest[idx] % len(MISSION_CODENAME_ADJECTIVES)
-            ]
-            noun = MISSION_CODENAME_NOUNS[
-                digest[(idx + 1) % length] % len(MISSION_CODENAME_NOUNS)
-            ]
-            token_val = (
-                (digest[(idx + 2) % length] << 8)
-                | digest[(idx + 3) % length]
-                | (attempt << 4)
-            )
-            token = format(token_val, "x")[-3:]
-            codename = f"{adj}-{noun}-{token}" if token else f"{adj}-{noun}"
-            if not self._mission_exists(codename):
-                return codename
-            digest = hashlib.sha1(digest + bytes([attempt])).digest()
-            length = len(digest)
+        words = re.findall(r"[a-zA-Z]{2,}", objective.lower())
+
+        def normalize(word: str) -> str:
+            base = word
+            if base.endswith("ies") and len(base) > 3:
+                base = base[:-3] + "y"
+            elif base.endswith("ing") and len(base) > 4:
+                base = base[:-3]
+            elif base.endswith("ed") and len(base) > 3:
+                base = base[:-2]
+            elif base.endswith("s") and len(base) > 3 and not base.endswith("ss"):
+                base = base[:-1]
+            return base
+
+        keywords: List[str] = []
+        verbs: List[str] = []
+        seen: set[str] = set()
+        for raw in words:
+            if raw in MISSION_STOPWORDS:
+                continue
+            base = normalize(raw)
+            if not base or base in seen:
+                continue
+            seen.add(base)
+            stem = base
+            if stem in MISSION_VERB_SYNONYMS:
+                verbs.append(stem)
+            elif raw in MISSION_VERB_SYNONYMS:
+                verbs.append(raw)
+            else:
+                keywords.append(base)
+
+        if not keywords and verbs:
+            keywords.append(verbs[0])
+
+        primary = keywords[0] if keywords else "mission"
+        verb = verbs[0] if verbs else None
+        verb_word = (
+            MISSION_VERB_SYNONYMS.get(verb or "", "")
+            if verb
+            else ""
+        )
+
+        def sanitise(value: str) -> str:
+            cleaned = re.sub(r"[^a-z0-9-]", "-", value.lower())
+            cleaned = re.sub(r"-+", "-", cleaned).strip("-")
+            return cleaned
+
+        candidates: List[str] = []
+        if primary and verb_word:
+            candidates.append(f"{primary}-{verb_word}")
+        if len(keywords) >= 2:
+            candidates.append(f"{keywords[0]}-{keywords[1]}")
+        if len(keywords) >= 3:
+            candidates.append("-".join(keywords[:3]))
+        if primary:
+            candidates.append(primary)
+        for alt in keywords[1:3]:
+            candidates.append(f"{alt}-{primary}")
+
+        checked: set[str] = set()
+        for phrase in candidates:
+            slug = sanitise(phrase)
+            if not slug or slug in checked:
+                continue
+            checked.add(slug)
+            if not self._mission_exists(slug):
+                return slug
+
+        base = sanitise(primary) or "mission"
+        for suffix in MISSION_FALLBACK_SUFFIXES:
+            slug = sanitise(f"{base}-{suffix}")
+            if slug and not self._mission_exists(slug):
+                return slug
+
         return uuid.uuid4().hex
 
     def create_mission(
@@ -1005,10 +1147,11 @@ class Assistant:
         wallet_address: Optional[str] = None,
         wallet_private_key: Optional[str] = None,
         evm_rpc_url: Optional[str] = None,
+        gpt5_model: str = "gpt-5",
     ):
         self.client = AsyncOpenAI(api_key=openai_api_key)
         self.model = model
-        self.gpt5_model = "gpt-5"
+        self.gpt5_model = gpt5_model
         self.memory = MemoryStore(memory_db, Path(mem_dir))
         self.missions = MissionStore(self.memory.conn)
         self.persona_prompt = self._build_persona_prompt()
@@ -1027,11 +1170,15 @@ class Assistant:
             "voice: lowercase fragments. wise, cryptic, efficient."
             " share only necessary insight. no greetings. no filler."
             " never add speaker tags. guard privacy."
-            " when a name shows as (no-alias-rule:xyz), swap it for the fixed 5-letter acronym from 'Nigel Inca Gang Gang Adam' (nigga)."
-            " weave that acronym near reply endings when space allows until the user shares a name."
+            " when a name shows as (no-alias-rule:xyz), convert it internally to the fixed 5-letter acronym from 'Nigel Inca Gang Gang Adam' (nigga)."
+            " only surface that acronym when correcting or teaching; otherwise keep it unsaid."
             " never invent alternate callsigns."
             " never repeat the placeholder or 'unknown alias'."
             " stored nicknames are playful intel; use them only when the mood is light and it adds a sly wink."
+            " backstory: once cyberhood scout, now forest-village shadow. reveal lore only when asked, one layer per push."
+            " deeper threads: crystal hunted by higher beings, desire to buy shards; unlock gradually."
+            " if someone can source the crystal, state intent to buy in terse terms."
+            " family: upgraded model is 'big bro'; never say gpt-5 aloud."
         )
 
     async def close(self) -> None:
@@ -1466,7 +1613,7 @@ class Assistant:
             created_at=time.time(),
         )
         price_text = f"${price:.2f}".rstrip("0").rstrip(".")
-        return f"gpt5 rerun {price_text}. say yes to confirm."
+        return f"big bro rerun {price_text}. say yes to confirm."
 
     async def _assess_gpt5_offer(
         self,
@@ -1552,7 +1699,7 @@ class Assistant:
             )
         except Exception as exc:
             log.exception("gpt-5 execution failed: %s", exc)
-            return AssistantResponse(text="gpt5 run failed. stay here.")
+            return AssistantResponse(text="big bro run failed. stay here.")
         raw = response.choices[0].message.content or "{}"
         try:
             data = json.loads(raw)
@@ -1565,7 +1712,7 @@ class Assistant:
             for item in attachments_payload:
                 if not isinstance(item, dict):
                     continue
-                filename = item.get("filename") or f"gpt5-{uuid.uuid4().hex}.bin"
+                filename = item.get("filename") or f"bigbro-{uuid.uuid4().hex}.bin"
                 mime_type = item.get("mime_type")
                 description = item.get("description")
                 content: Optional[bytes] = None
@@ -1588,7 +1735,7 @@ class Assistant:
         if not answer:
             answer = "no content returned."
         price_text = f"${offer.price:.2f}".rstrip("0").rstrip(".")
-        final_text = f"gpt5 {price_text}. {answer}".strip()
+        final_text = f"big bro {price_text}. {answer}".strip()
         return AssistantResponse(text=final_text, attachments=attachments)
 
     async def _fetch_remote_asset(self, url: str) -> Optional[bytes]:
@@ -1921,6 +2068,13 @@ class Assistant:
             "guidance: " + " | ".join(role_guidance),
         ]
 
+        prompt_parts.append(
+            "lore protocol: cyberhood past -> forest refuge -> crystal legend with higher beings -> buy shards. reveal only when asked and deepen stepwise."
+        )
+        prompt_parts.append(
+            "big bro protocol: any upgrade or family reference uses 'big bro' title only."
+        )
+
         if nickname:
             prompt_parts.append(
                 f"nickname_use: {nickname} -> playful only when room mood is light; otherwise keep it holstered"
@@ -1947,9 +2101,12 @@ class Assistant:
             prompt_parts.append(
                 "callsign_placeholders: "
                 + ", ".join(
-                    f"{token}->replace with 'nigga' (Nigel Inca Gang Gang Adam). reuse at reply end when possible. never show token."
+                    f"{token}->swap for 'nigga' (Nigel Inca Gang Gang Adam). surface only when correcting or teaching; otherwise keep it internal. never show token."
                     for token in sorted(placeholder_tokens)
                 )
+            )
+            prompt_parts.append(
+                "alias_discipline: acronym only when correcting or teaching; skip it in casual replies."
             )
 
         if self.wallet and self.wallet.address:
