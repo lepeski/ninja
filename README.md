@@ -12,6 +12,7 @@ Ninja is a shared conversational brain that powers both Discord and Telegram. A 
 - **Selective group awareness** – Discord group replies trigger on summons, implicit questions, or recent-thread follow-ups while idle chatter is ignored.
 - **Inbox archiving** – First-contact private messages are archived in `mem/inbox/` before the assistant replies.
 - **GPT-5 upgrades + wallet** – The agent can upsell complex jobs to GPT-5, quote costs, accept payment, and track an on-chain wallet for payouts or fast opportunistic sends.
+- **Dual-chain crypto** – Configure both Ethereum and PulseChain RPC endpoints so the same wallet can operate on either chain when the model requests it.
 - **Hidden lore** – Curious operators can probe the Cyberhood backstory, the forest refuge, and the crystal hunt in short, cryptic fragments.
 
 ## Requirements
@@ -38,7 +39,7 @@ pip install -r requirements.txt
    - `OPENAI_API_KEY`
    - `DISCORD_TOKEN`
    - `TELEGRAM_TOKEN`
-   - Optional overrides: `MODEL` (defaults to `gpt-4.1`), `GPT5_MODEL`, `MEM_DIR`, `DISCORD_GUILD_ID`, `EVM_RPC_URL`, `EVM_WALLET_ADDRESS`, `EVM_WALLET_PRIVATE_KEY`
+   - Optional overrides: `MODEL` (defaults to `gpt-4.1`), `GPT5_MODEL`, `MEM_DIR`, `DISCORD_GUILD_ID`, `EVM_RPC_URL`, `PULSECHAIN_RPC_URL`, `EVM_WALLET_ADDRESS`, `EVM_WALLET_PRIVATE_KEY`
 3. Ensure the `mem/` directory remains writable (it is created automatically on first run).
 
 ## Running
@@ -54,7 +55,11 @@ Telegram offers `/assignagenda <goal> [timeout_hours]` and `/stopagenda <mission
 
 When a mission times out, the assistant automatically notifies the creator via DM with a concise summary. Mission creators can also request snapshots programmatically through `Assistant.get_mission_status("platform:user")`.
 
-After solving a demanding task the assistant may pitch a GPT-5 deep dive. It estimates OpenAI usage, quotes either $1 or ten times the cost (whichever is larger than $1), waits for confirmation, and then runs the upgraded job. Wallet credentials let the agent advertise a fixed deposit address, check balances silently, and—when the model flags a short-term gain—emit wallet directives that the runtime executes to send ETH.
+After solving a demanding task the assistant may pitch a GPT-5 deep dive. It estimates OpenAI usage, quotes either $1 or ten times the cost (whichever is larger than $1), waits for confirmation, and then runs the upgraded job. Wallet credentials let the agent advertise a fixed deposit address, check balances silently, and—when the model flags a short-term gain—emit wallet directives that the runtime executes to send ETH. Add `network:"pulse"` inside a wallet directive to operate on PulseChain once `PULSECHAIN_RPC_URL` is configured.
+
+## Tuning the voice
+
+See [`VOICE_TUNING.md`](VOICE_TUNING.md) for pointers on adjusting the assistant's tone, rules, and prompt snippets safely.
 
 ## Data Layout
 

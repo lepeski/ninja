@@ -23,6 +23,7 @@ async def main():
     guild_id_raw = os.getenv("DISCORD_GUILD_ID")
     guild_id = int(guild_id_raw) if guild_id_raw and guild_id_raw.isdigit() else None
     evm_rpc_url = os.getenv("EVM_RPC_URL")
+    pulse_rpc_url = os.getenv("PULSECHAIN_RPC_URL")
     wallet_private_key = os.getenv("EVM_WALLET_PRIVATE_KEY")
     wallet_address = os.getenv("EVM_WALLET_ADDRESS")
 
@@ -34,6 +35,7 @@ async def main():
         model=model,
         mem_dir=mem_dir,
         evm_rpc_url=evm_rpc_url,
+        pulse_rpc_url=pulse_rpc_url,
         wallet_private_key=wallet_private_key,
         wallet_address=wallet_address,
         gpt5_model=gpt5_model,

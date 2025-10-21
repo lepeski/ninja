@@ -493,46 +493,94 @@ class Journal:
 
 
 class EvmWallet:
-    """Minimal EVM wallet helper for balance checks and transfers."""
+    """Minimal multi-network EVM wallet helper for balance checks and transfers."""
 
     def __init__(
         self,
         *,
         rpc_url: Optional[str] = None,
+        pulse_rpc_url: Optional[str] = None,
         private_key: Optional[str] = None,
         address: Optional[str] = None,
     ) -> None:
-        self.rpc_url = rpc_url
+        self._networks: Dict[str, Optional[Web3]] = {}
+        self._network_labels: Dict[str, str] = {}
+        self._default_network: Optional[str] = None
         self._private_key = private_key
-        self._address_override = address
-        self._client: Optional[Web3] = None
         self._account = None
+        self._address_override = address
         if Web3 and rpc_url:
-            try:
-                self._client = Web3(Web3.HTTPProvider(rpc_url))
-            except Exception as exc:  # pragma: no cover - provider init failure is logged
-                log.warning("Failed to initialise Web3 provider: %s", exc)
-                self._client = None
-        if self._client and private_key and Account:
+            self._register_network("main", rpc_url, label="mainnet")
+        if Web3 and pulse_rpc_url:
+            self._register_network("pulse", pulse_rpc_url, label="pulsechain")
+        if not self._default_network and self._networks:
+            self._default_network = next(iter(self._networks.keys()))
+        if private_key and Account:
             try:
                 self._account = Account.from_key(private_key)
             except Exception as exc:  # pragma: no cover - invalid key
                 log.error("Invalid EVM private key: %s", exc)
                 self._account = None
         self.address = None
+        default_client = self._get_client(self._default_network)
         if self._account:
             self.address = self._account.address
-        elif address and self._client:
+        elif address and default_client:
             try:
-                self.address = self._client.to_checksum_address(address)
+                self.address = default_client.to_checksum_address(address)
             except Exception:
                 self.address = address
         else:
             self.address = address
 
+    def _register_network(self, key: str, rpc_url: str, *, label: str) -> None:
+        try:
+            client = Web3(Web3.HTTPProvider(rpc_url)) if Web3 else None
+        except Exception as exc:  # pragma: no cover - provider init failure is logged
+            log.warning("Failed to initialise Web3 provider for %s: %s", key, exc)
+            client = None
+        self._networks[key] = client
+        self._network_labels[key] = label
+        if not self._default_network:
+            self._default_network = key
+
+    def _get_client(self, network: Optional[str]) -> Optional[Web3]:
+        if not network:
+            return None
+        return self._networks.get(network)
+
+    def resolve_network(self, name: Optional[str]) -> Optional[str]:
+        if not self._networks:
+            return None
+        if not name:
+            return self._default_network
+        lowered = str(name).strip().lower()
+        if lowered in self._networks:
+            return lowered
+        alias_map = {
+            "pulsechain": "pulse",
+            "pulse": "pulse",
+            "pls": "pulse",
+            "plsx": "pulse",
+            "main": "main",
+            "ethereum": "main",
+            "eth": "main",
+        }
+        mapped = alias_map.get(lowered)
+        if mapped and mapped in self._networks:
+            return mapped
+        if name:
+            return None
+        return self._default_network
+
+    def network_label(self, network: Optional[str]) -> str:
+        if not network:
+            return "network"
+        return self._network_labels.get(network, network)
+
     @property
     def available(self) -> bool:
-        return bool(self._client and self.address)
+        return bool(self.address and any(client for client in self._networks.values()))
 
     @property
     def can_send(self) -> bool:
@@ -550,12 +598,12 @@ class EvmWallet:
             return float(client.from_wei(value, unit))
         return float(client.fromWei(value, unit))  # type: ignore[attr-defined]
 
-    async def get_balance_eth(self) -> Optional[float]:
-        if not self.available:
-            return None
-        client = self._client
+    async def get_balance_eth(self, network: Optional[str] = None) -> Optional[float]:
+        resolved = self.resolve_network(network)
+        client = self._get_client(resolved)
         address = self.address
-        assert client is not None and address is not None
+        if not client or not address:
+            return None
 
         def _get_balance() -> float:
             balance_wei = client.eth.get_balance(address)
@@ -565,7 +613,7 @@ class EvmWallet:
         try:
             return await loop.run_in_executor(None, _get_balance)
         except Exception as exc:  # pragma: no cover - rpc failures logged
-            log.warning("Failed to fetch wallet balance: %s", exc)
+            log.warning("Failed to fetch wallet balance for %s: %s", resolved, exc)
             return None
 
     async def send_eth(
@@ -574,17 +622,19 @@ class EvmWallet:
         to_address: str,
         amount_eth: float,
         gas_price_gwei: Optional[float] = None,
+        network: Optional[str] = None,
     ) -> Optional[str]:
         if not self.can_send:
             raise RuntimeError("Wallet not configured for sending funds")
-        client = self._client
+        resolved = self.resolve_network(network)
+        client = self._get_client(resolved)
         account = self._account
-        assert client is not None and account is not None
+        if not client or not account:
+            raise RuntimeError("Requested network unavailable")
         to_checksum = client.to_checksum_address(to_address)
 
         def _send() -> str:
             nonce = client.eth.get_transaction_count(account.address)
-            gas_price = None
             if gas_price_gwei is not None:
                 gas_price = self._to_wei(client, gas_price_gwei, "gwei")
             else:
@@ -605,7 +655,7 @@ class EvmWallet:
         try:
             return await loop.run_in_executor(None, _send)
         except Exception as exc:  # pragma: no cover - transaction issues logged
-            log.error("Failed to send transaction: %s", exc)
+            log.error("Failed to send transaction on %s: %s", resolved, exc)
             return None
 
 
@@ -1373,6 +1423,7 @@ class Assistant:
         wallet_address: Optional[str] = None,
         wallet_private_key: Optional[str] = None,
         evm_rpc_url: Optional[str] = None,
+        pulse_rpc_url: Optional[str] = None,
         gpt5_model: str = "gpt-5",
     ):
         self.client = AsyncOpenAI(api_key=openai_api_key)
@@ -1397,9 +1448,10 @@ class Assistant:
         self._pending_notifications: List[Notification] = []
         self._pending_gpt5_offers: Dict[Tuple[str, str], PendingGpt5Offer] = {}
         self.wallet: Optional[EvmWallet] = None
-        if evm_rpc_url and (wallet_private_key or wallet_address):
+        if (evm_rpc_url or pulse_rpc_url) and (wallet_private_key or wallet_address):
             self.wallet = EvmWallet(
                 rpc_url=evm_rpc_url,
+                pulse_rpc_url=pulse_rpc_url,
                 private_key=wallet_private_key,
                 address=wallet_address,
             )
@@ -1879,11 +1931,20 @@ class Assistant:
         action = str(command.get("action") or "").lower()
         if not self.wallet or not self.wallet.available:
             return "wallet offline."
+        network_request = command.get("network") or command.get("chain")
+        network_key = self.wallet.resolve_network(network_request)
+        network_label = self.wallet.network_label(network_key)
+        if network_request and network_key is None:
+            return "network offline."
         if action == "balance":
-            balance = await self.wallet.get_balance_eth()
+            balance = await self.wallet.get_balance_eth(network_key)
             if balance is None:
                 return "wallet offline."
-            return f"balance {balance:.4f} eth"
+            return f"{network_label} balance {balance:.4f} eth"
+        if action == "address":
+            if not self.wallet.address:
+                return "wallet offline."
+            return f"wallet: {self.wallet.address}"
         if action == "send":
             if not self.wallet.can_send:
                 return "send locked."
@@ -1902,19 +1963,31 @@ class Assistant:
                     gas_price = float(gas_price_val)
                 except (TypeError, ValueError):
                     gas_price = None
-            tx_hash = await self.wallet.send_eth(
-                to_address=str(to_address),
-                amount_eth=amount,
-                gas_price_gwei=gas_price,
-            )
+            try:
+                tx_hash = await self.wallet.send_eth(
+                    to_address=str(to_address),
+                    amount_eth=amount,
+                    gas_price_gwei=gas_price,
+                    network=network_key,
+                )
+            except RuntimeError:
+                return "network offline."
             if not tx_hash:
                 return "send failed."
             short_to = str(to_address)
             if len(short_to) > 12:
                 short_to = f"{short_to[:6]}…{short_to[-4:]}"
-            log.info("Wallet sent %.6f ETH to %s (tx=%s)", amount, to_address, tx_hash)
-            self._journal(f"wallet sent {amount:.4f} eth to {short_to}")
-            return f"sent {amount:.4f} eth -> {short_to}"
+            log.info(
+                "Wallet sent %.6f ETH to %s on %s (tx=%s)",
+                amount,
+                to_address,
+                network_label,
+                tx_hash,
+            )
+            self._journal(
+                f"wallet sent {amount:.4f} eth to {short_to} on {network_label}"
+            )
+            return f"{network_label} sent {amount:.4f} eth -> {short_to}"
         if action:
             return "wallet action unknown."
         return None
@@ -1948,7 +2021,7 @@ class Assistant:
         offer_key = (platform, user_id)
         if self._pending_gpt5_offers.get(offer_key):
             return None
-        if len(user_message.split()) < 20 and len(user_message) < 160:
+        if len(user_message.split()) < 6 and len(user_message) < 40:
             return None
         assessment = await self._assess_gpt5_offer(
             user_message=user_message,
@@ -2496,6 +2569,7 @@ class Assistant:
                     "wallet_ops: share address on request. only send when fast upside is credible."
                     " encode transfers with [[wallet:{\"action\":\"send\",\"to\":\"0x...\",\"amount_eth\":value}]]"
                     " and balance checks with [[wallet:{\"action\":\"balance\"}]]."
+                    " add \"network\":\"pulse\" when using pulsechain."
                 )
             else:
                 prompt_parts.append(
