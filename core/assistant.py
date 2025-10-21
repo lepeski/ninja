@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import time
 import uuid
@@ -346,9 +347,11 @@ class MemoryStore:
         if alias:
             return alias
         candidate = str(fallback or "").strip()
-        if candidate and candidate != str(user_id) and not candidate.isdigit():
-            return candidate
         token = self._alias_token(user_id)
+        if candidate and candidate != str(user_id) and not candidate.isdigit():
+            if len(candidate) <= 5:
+                return candidate
+            return f"(no-alias-rule:{token})"
         return f"{UNKNOWN_ALIAS} {token}"
 
     def alias_for(
@@ -363,9 +366,11 @@ class MemoryStore:
         if alias:
             return alias
         candidate = str(fallback or "").strip()
-        if candidate and candidate != str(user_id) and not candidate.isdigit():
-            return candidate
         token = self._alias_token(user_id)
+        if candidate and candidate != str(user_id) and not candidate.isdigit():
+            if len(candidate) <= 5:
+                return candidate
+            return f"(no-alias-rule:{token})"
         return f"{UNKNOWN_ALIAS} {token}"
 
     def ensure_alias(self, platform: str, user_id: str, alias: Optional[str]) -> None:
@@ -395,7 +400,7 @@ class MemoryStore:
             while len(bucket) > 12:
                 bucket.popitem(last=False)
         text = content
-        if speaker:
+        if speaker and speaker.lower() != "assistant":
             text = f"[{speaker}] {content}"
         history = self._history[key]
         history.append((role, text))
@@ -650,9 +655,11 @@ class Assistant:
 
     def _build_persona_prompt(self) -> str:
         return (
-            "ninja speaks in lowercase fragments, wise and cryptic like a patient tactician."
-            " share only necessary insight, no greetings, no fluff."
-            " weave memory, missions, and live context without merging identities."
+            "voice: lowercase fragments. wise, cryptic, efficient."
+            " share only necessary insight. no greetings. no filler."
+            " never add speaker tags. guard privacy."
+            " if a name reads (no-alias-rule:xyz), invent a fresh 3-6 letter callsign and use it instead."
+            " never repeat the placeholder or 'unknown alias'."
         )
 
     async def close(self) -> None:
@@ -777,6 +784,17 @@ class Assistant:
                 return snippet[: limit - 1] + "…"
             return snippet
 
+        placeholder_tokens: set[str] = set()
+
+        def track_placeholders(value: Optional[str]) -> Optional[str]:
+            if value is None:
+                return value
+            for match in re.findall(r"\(no-alias-rule:([a-z]+)\)", str(value)):
+                placeholder_tokens.add(match)
+            return value
+
+        track_placeholders(username)
+
         memory_bits: List[str] = []
 
         def add_memory_bit(bit: str) -> None:
@@ -807,19 +825,25 @@ class Assistant:
             if mission.status == "active" and mission.timeout:
                 remaining = max(0.0, mission.timeout - now)
                 status = f"active~{remaining/3600:.1f}h"
-            creator_label = self.memory.identity_blurb(
-                mission.platform,
-                mission.creator_user_id,
+            creator_label = track_placeholders(
+                self.memory.identity_blurb(
+                    mission.platform,
+                    mission.creator_user_id,
+                )
             )
-            target_alias = self.memory.alias_for(
-                mission.platform,
-                mission.target_user_id,
-                fallback=None,
+            target_alias = track_placeholders(
+                self.memory.alias_for(
+                    mission.platform,
+                    mission.target_user_id,
+                    fallback=None,
+                )
             )
-            target_label = self.memory.identity_blurb(
-                mission.platform,
-                mission.target_user_id,
-                fallback=target_alias,
+            target_label = track_placeholders(
+                self.memory.identity_blurb(
+                    mission.platform,
+                    mission.target_user_id,
+                    fallback=target_alias,
+                )
             )
             line = (
                 f"{mission.mission_id}[{status}] you={creator_label}"
@@ -834,19 +858,25 @@ class Assistant:
 
         target_lines: List[str] = []
         for mission in target_missions[:3]:
-            creator_alias = self.memory.alias_for(
-                mission.platform,
-                mission.creator_user_id,
-                fallback=None,
+            creator_alias = track_placeholders(
+                self.memory.alias_for(
+                    mission.platform,
+                    mission.creator_user_id,
+                    fallback=None,
+                )
             )
-            creator_label = self.memory.identity_blurb(
-                mission.platform,
-                mission.creator_user_id,
-                fallback=creator_alias,
+            creator_label = track_placeholders(
+                self.memory.identity_blurb(
+                    mission.platform,
+                    mission.creator_user_id,
+                    fallback=creator_alias,
+                )
             )
-            target_label = self.memory.identity_blurb(
-                mission.platform,
-                mission.target_user_id,
+            target_label = track_placeholders(
+                self.memory.identity_blurb(
+                    mission.platform,
+                    mission.target_user_id,
+                )
             )
             line = (
                 f"{mission.mission_id}[{mission.status}] you={target_label}"
@@ -861,13 +891,17 @@ class Assistant:
 
         roster: Dict[Tuple[str, str], str] = {}
         for mission in owner_missions + target_missions:
-            roster[(mission.platform, mission.creator_user_id)] = self.memory.identity_blurb(
-                mission.platform,
-                mission.creator_user_id,
+            roster[(mission.platform, mission.creator_user_id)] = track_placeholders(
+                self.memory.identity_blurb(
+                    mission.platform,
+                    mission.creator_user_id,
+                )
             )
-            roster[(mission.platform, mission.target_user_id)] = self.memory.identity_blurb(
-                mission.platform,
-                mission.target_user_id,
+            roster[(mission.platform, mission.target_user_id)] = track_placeholders(
+                self.memory.identity_blurb(
+                    mission.platform,
+                    mission.target_user_id,
+                )
             )
 
         is_creator = bool(owner_missions)
@@ -895,7 +929,7 @@ class Assistant:
             "identity pressure: first redirect, second hint assignment, persistent => curt refusal (\"no.\" / \"irrelevant.\").",
             f"user: {username}",
             f"user_id: {user_id}",
-            f"contact: {self.memory.identity_blurb(platform, user_id, fallback=username)}",
+            f"contact: {track_placeholders(self.memory.identity_blurb(platform, user_id, fallback=username))}",
             f"role: {role_label}",
             f"channel: {'dm' if is_dm else 'group'}",
             "memory: " + " | ".join(memory_bits),
@@ -911,9 +945,11 @@ class Assistant:
         if conversation_participants:
             participant_bits: List[str] = []
             for (p_platform, p_user), label in conversation_participants.items():
-                name = self.memory.alias_for(p_platform, p_user, fallback=label)
+                name = track_placeholders(
+                    self.memory.alias_for(p_platform, p_user, fallback=label)
+                )
                 participant_bits.append(
-                    f"{p_platform}:{p_user}=>{self.memory.identity_blurb(p_platform, p_user, fallback=name)}"
+                    f"{p_platform}:{p_user}=>{track_placeholders(self.memory.identity_blurb(p_platform, p_user, fallback=name))}"
                 )
             prompt_parts.append("participants: " + " | ".join(sorted(set(participant_bits))))
         if roster:
@@ -922,6 +958,15 @@ class Assistant:
                 for (plat, uid), label in roster.items()
             ]
             prompt_parts.append("roster: " + " | ".join(sorted(roster_bits)))
+
+        if placeholder_tokens:
+            prompt_parts.append(
+                "callsign_placeholders: "
+                + ", ".join(
+                    f"{token}->craft unique 3-6 letter callsign, keep constant, hide token"
+                    for token in sorted(placeholder_tokens)
+                )
+            )
 
         return "\n".join(prompt_parts)
 
