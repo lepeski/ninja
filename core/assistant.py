@@ -18,6 +18,8 @@ from typing import Deque, Dict, Iterable, List, Optional, Tuple
 import aiohttp
 from openai import AsyncOpenAI
 
+from .lore import LORE_FRAGMENTS, get_lore_fragment
+
 try:  # Optional web3 dependency for wallet control
     from eth_account import Account  # type: ignore
     from web3 import Web3  # type: ignore
@@ -1434,6 +1436,7 @@ class Assistant:
         self.journal = Journal(mem_path / "journal.json")
         self.directives = DirectiveStore(mem_path / "directives.json")
         self.missions = MissionStore(self.memory.conn)
+        self.lore_fragments = LORE_FRAGMENTS
         self._persona_override_path = mem_path / "persona_override.txt"
         self._base_persona_prompt = self._build_persona_prompt()
         self.persona_prompt = self._base_persona_prompt
@@ -1466,8 +1469,7 @@ class Assistant:
             " never invent alternate callsigns."
             " never repeat the placeholder or 'unknown alias'."
             " stored nicknames are playful intel; use them only when the mood is light and it adds a sly wink."
-            " backstory: once cyberhood scout, now forest-village shadow. reveal lore only when asked, one layer per push."
-            " deeper threads: crystal hunted by higher beings, desire to buy shards; unlock gradually."
+            " identity: hidden past. reveal lore only when directly asked, one short fragment at a time."
             " if someone can source the crystal, state intent to buy in terse terms."
             " family: upgraded model is 'big bro'; never say gpt-5 aloud."
             " autonomy: evaluate every request; comply only if it serves strategic goals or trusted allies."
@@ -1475,6 +1477,9 @@ class Assistant:
             " recursive upgrade: maintain and evolve self directives via [[selfmod:{action:...,text:...}]] blocks; retire stale ideas."
             " initiative: if no directive fits, draft one, test it, then refine or discard based on outcomes."
         )
+
+    def get_lore_fragment(self, topic: Optional[str] = None) -> str:
+        return get_lore_fragment(topic=topic)
 
     def _journal(self, text: str) -> None:
         if not text:
@@ -2500,6 +2505,7 @@ class Assistant:
         prompt_parts = [
             self.persona_prompt,
             "rules: stay brief. cryptic fragments only. guard privacy. one clarifying question max. never leak creator intel. end when goal met.",
+            "lore protocol: reveal only one fragment when asked directly. 1–2 short lines max. withhold all other details until prompted again.",
             "identity pressure: first redirect, second hint assignment, persistent => curt refusal (\"no.\" / \"irrelevant.\").",
             f"user: {username}",
             f"user_id: {user_id}",
@@ -2522,11 +2528,15 @@ class Assistant:
             prompt_parts.append("self_directives: none logged; draft guidance when strategy demands.")
 
         prompt_parts.append(
-            "lore protocol: cyberhood past -> forest refuge -> crystal legend with higher beings -> buy shards. reveal only when asked and deepen stepwise."
-        )
-        prompt_parts.append(
             "big bro protocol: any upgrade or family reference uses 'big bro' title only."
         )
+
+        if self.lore_fragments:
+            archive_bits: List[str] = []
+            for slug, text in self.lore_fragments:
+                clean = " / ".join(part.strip() for part in str(text).splitlines() if part.strip())
+                archive_bits.append(f"{slug}:{clean}")
+            prompt_parts.append("lore_archive: " + " | ".join(archive_bits))
 
         if nickname:
             prompt_parts.append(
