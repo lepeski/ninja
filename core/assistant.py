@@ -4,7 +4,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Deque, Dict, Iterable, List, Optional, Tuple
@@ -86,6 +86,9 @@ class MemoryStore:
         self._history: Dict[Tuple[str, str], Deque[Tuple[str, str]]] = defaultdict(
             lambda: deque(maxlen=MAX_HISTORY)
         )
+        self._participants: Dict[
+            Tuple[str, str], OrderedDict[Tuple[str, str], str]
+        ] = defaultdict(OrderedDict)
         self._seen_first_contact: set[Tuple[str, str]] = set()
         self._alias_by_user: Dict[Tuple[str, str], str] = {}
         self._alias_index: Dict[Tuple[str, str], set[str]] = defaultdict(set)
@@ -315,7 +318,8 @@ class MemoryStore:
         candidate = str(fallback or "").strip()
         if candidate and candidate != str(user_id) and not candidate.isdigit():
             return candidate
-        return UNKNOWN_ALIAS
+        token = self._alias_token(user_id)
+        return f"{UNKNOWN_ALIAS} {token}"
 
     def alias_for(
         self,
@@ -331,7 +335,8 @@ class MemoryStore:
         candidate = str(fallback or "").strip()
         if candidate and candidate != str(user_id) and not candidate.isdigit():
             return candidate
-        return UNKNOWN_ALIAS
+        token = self._alias_token(user_id)
+        return f"{UNKNOWN_ALIAS} {token}"
 
     def ensure_alias(self, platform: str, user_id: str, alias: Optional[str]) -> None:
         clean = str(alias or "").strip()
@@ -343,10 +348,27 @@ class MemoryStore:
         profile["alias"] = clean
         self._save(platform, user_id, profile)
 
-    def log_history(self, platform: str, conversation_id: str, role: str, content: str) -> None:
+    def log_history(
+        self,
+        platform: str,
+        conversation_id: str,
+        role: str,
+        content: str,
+        *,
+        speaker: Optional[str] = None,
+        speaker_user_id: Optional[str] = None,
+    ) -> None:
         key = (platform, conversation_id)
+        if speaker and speaker_user_id:
+            bucket = self._participants[key]
+            bucket[(platform, speaker_user_id)] = speaker
+            while len(bucket) > 12:
+                bucket.popitem(last=False)
+        text = content
+        if speaker:
+            text = f"[{speaker}] {content}"
         history = self._history[key]
-        history.append((role, content))
+        history.append((role, text))
         total_chars = sum(len(item[1]) for item in history)
         while total_chars > HISTORY_MAX_CHARS and len(history) > 1:
             removed = history.popleft()
@@ -354,6 +376,23 @@ class MemoryStore:
 
     def get_history(self, platform: str, conversation_id: str) -> List[Tuple[str, str]]:
         return list(self._history[(platform, conversation_id)])
+
+    def register_participant(
+        self, platform: str, conversation_id: str, user_id: str, label: str
+    ) -> None:
+        key = (platform, conversation_id)
+        bucket = self._participants[key]
+        bucket[(platform, user_id)] = label
+        while len(bucket) > 12:
+            bucket.popitem(last=False)
+
+    def conversation_participants(
+        self, platform: str, conversation_id: str
+    ) -> Dict[Tuple[str, str], str]:
+        bucket = self._participants.get((platform, conversation_id))
+        if not bucket:
+            return {}
+        return dict(bucket)
 
     def record_first_contact(
         self, platform: str, user_id: str, username: str, message: str
@@ -587,6 +626,8 @@ class Assistant:
             username or user_id,
             profile=profile,
         )
+        self.memory.register_participant(platform, conversation_id, user_id, display_name)
+        participants = self.memory.conversation_participants(platform, conversation_id)
         owner_missions = self.missions.get_active_for_creator(platform, user_id)
         target_missions = self.missions.get_active_for_target(platform, user_id)
         history = self.memory.get_history(platform, conversation_id)
@@ -598,11 +639,13 @@ class Assistant:
             is_dm=is_dm,
             user_id=user_id,
             platform=platform,
+            conversation_participants=participants,
         )
         messages_payload = [{"role": "system", "content": system_prompt}]
         for role, content in history:
             messages_payload.append({"role": role, "content": content})
-        messages_payload.append({"role": "user", "content": trimmed})
+        user_payload = f"[{display_name}] {trimmed}" if display_name else trimmed
+        messages_payload.append({"role": "user", "content": user_payload})
         try:
             response = await self.client.chat.completions.create(
                 model=self.model,
@@ -614,9 +657,22 @@ class Assistant:
             log.exception("OpenAI chat failure: %s", exc)
             return "I'm offline for a moment."
         reply = response.choices[0].message.content or ""
-        self.memory.log_history(platform, conversation_id, "user", trimmed)
+        self.memory.log_history(
+            platform,
+            conversation_id,
+            "user",
+            trimmed,
+            speaker=display_name,
+            speaker_user_id=user_id,
+        )
         if reply:
-            self.memory.log_history(platform, conversation_id, "assistant", reply)
+            self.memory.log_history(
+                platform,
+                conversation_id,
+                "assistant",
+                reply,
+                speaker="assistant",
+            )
         self._log_mission_exchange(
             platform=platform,
             user_id=user_id,
@@ -651,6 +707,7 @@ class Assistant:
         is_dm: bool,
         user_id: str,
         platform: str,
+        conversation_participants: Dict[Tuple[str, str], str],
     ) -> str:
         def shorten(text: str, limit: int = 160) -> str:
             snippet = (text or "").strip()
@@ -789,6 +846,14 @@ class Assistant:
             prompt_parts.append(
                 "target_missions (internal, keep secret): " + " | ".join(target_lines)
             )
+        if conversation_participants:
+            participant_bits: List[str] = []
+            for (p_platform, p_user), label in conversation_participants.items():
+                name = self.memory.alias_for(p_platform, p_user, fallback=label)
+                participant_bits.append(
+                    f"{p_platform}:{p_user}=>{self.memory.identity_blurb(p_platform, p_user, fallback=name)}"
+                )
+            prompt_parts.append("participants: " + " | ".join(sorted(set(participant_bits))))
         if roster:
             roster_bits = [
                 f"{plat}:{uid}=>{label}"

@@ -88,11 +88,43 @@ class DiscordTransport(commands.Bot):
             return
         channel_id = str(message.channel.id)
         is_dm = message.guild is None
+        content = message.content
+        triggered = is_dm
+        if not triggered:
+            stripped = content.strip()
+            lowered = stripped.lower()
+            if lowered.startswith("ninja"):
+                triggered = True
+                stripped = stripped[len("ninja") :].lstrip(" ,:;-\t")
+                if not stripped:
+                    stripped = "ninja"
+            elif self.user and self.user.mention in content:
+                triggered = True
+            elif self.user and any(
+                variant in content
+                for variant in (f"<@{self.user.id}>", f"<@!{self.user.id}>")
+            ):
+                triggered = True
+            if not triggered:
+                return
+            if stripped != content.strip():
+                content = stripped
+            elif self.user and triggered:
+                for variant in (
+                    self.user.mention,
+                    f"<@{self.user.id}>",
+                    f"<@!{self.user.id}>",
+                ):
+                    if variant in content:
+                        content = content.replace(variant, "", 1).strip()
+                        break
+            if not content.strip():
+                content = "ninja"
         try:
             result = await self.assistant.handle_message(
                 platform="discord",
                 user_id=str(message.author.id),
-                message=message.content,
+                message=content,
                 username=message.author.display_name,
                 channel_id=channel_id,
                 is_dm=is_dm,

@@ -38,11 +38,34 @@ class TelegramTransport:
         if not message or not message.text or not user or user.is_bot or not chat:
             return
         is_dm = chat.type == ChatType.PRIVATE
+        text = message.text
+        triggered = is_dm
+        if not triggered:
+            stripped = text.strip()
+            lowered = stripped.lower()
+            if lowered.startswith("ninja"):
+                triggered = True
+                stripped = stripped[len("ninja") :].lstrip(" ,:;-\t")
+                if not stripped:
+                    stripped = "ninja"
+            else:
+                bot_username = (context.bot.username or "").lower() if context.bot else ""
+                mention_prefix = f"@{bot_username}" if bot_username else ""
+                if mention_prefix and lowered.startswith(mention_prefix):
+                    triggered = True
+                    stripped = stripped[len(mention_prefix) :].lstrip(" ,:;-\t")
+                    if not stripped:
+                        stripped = "ninja"
+            if not triggered:
+                return
+            text = stripped
+        if not text.strip():
+            text = "ninja"
         try:
             result = await self.assistant.handle_message(
                 platform="telegram",
                 user_id=str(user.id),
-                message=message.text,
+                message=text,
                 username=user.full_name or user.username or str(user.id),
                 channel_id=str(chat.id),
                 is_dm=is_dm,
