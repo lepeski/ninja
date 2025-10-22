@@ -1179,6 +1179,44 @@ class MemoryStore:
             log.warning("Failed to archive first contact DM: %s", exc)
 
 
+class ContextWindow:
+    """Ephemeral context cache that tracks recent conversation state."""
+
+    def __init__(self, max_entries: int = 12) -> None:
+        self.max_entries = max_entries
+        self._store: Dict[Tuple[str, str], OrderedDict[str, str]] = defaultdict(
+            OrderedDict
+        )
+        self._lock = threading.Lock()
+
+    def update(
+        self,
+        platform: str,
+        conversation_id: str,
+        entries: Dict[str, Optional[str]],
+    ) -> None:
+        key = (platform, conversation_id)
+        with self._lock:
+            bucket = self._store[key]
+            for entry_key, value in entries.items():
+                if not entry_key:
+                    continue
+                if value and value.strip():
+                    bucket[entry_key] = value.strip()
+                elif entry_key in bucket:
+                    bucket.pop(entry_key, None)
+            while len(bucket) > self.max_entries:
+                bucket.popitem(last=False)
+
+    def snapshot(self, platform: str, conversation_id: str) -> List[str]:
+        key = (platform, conversation_id)
+        with self._lock:
+            bucket = self._store.get(key)
+            if not bucket:
+                return []
+            return list(bucket.values())
+
+
 class MissionStore:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
@@ -1436,6 +1474,7 @@ class Assistant:
         self.journal = Journal(mem_path / "journal.json")
         self.directives = DirectiveStore(mem_path / "directives.json")
         self.missions = MissionStore(self.memory.conn)
+        self.context_window = ContextWindow()
         self.lore_fragments = LORE_FRAGMENTS
         self._persona_override_path = mem_path / "persona_override.txt"
         self._base_persona_prompt = self._build_persona_prompt()
@@ -1450,6 +1489,8 @@ class Assistant:
                 self.persona_prompt = override
         self._pending_notifications: List[Notification] = []
         self._pending_gpt5_offers: Dict[Tuple[str, str], PendingGpt5Offer] = {}
+        self._last_gpt5_assessment: Dict[Tuple[str, str], float] = {}
+        self._mission_eval_markers: Dict[str, int] = {}
         self.wallet: Optional[EvmWallet] = None
         if (evm_rpc_url or pulse_rpc_url) and (wallet_private_key or wallet_address):
             self.wallet = EvmWallet(
@@ -1509,6 +1550,107 @@ class Assistant:
         entry = f"{main}. {context}".strip()
         self._journal(entry)
 
+    @staticmethod
+    def _shrink_text(value: Optional[str], limit: int = 80) -> str:
+        snippet = (value or "").strip()
+        if not snippet:
+            return ""
+        if len(snippet) > limit:
+            return snippet[: limit - 1] + "…"
+        return snippet
+
+    def _format_context_missions(
+        self, missions: List[MissionRecord], *, label: str
+    ) -> Optional[str]:
+        if not missions:
+            return None
+        now = time.time()
+        bits: List[str] = []
+        for mission in missions[:3]:
+            status = mission.status
+            if mission.status == "active" and mission.timeout:
+                remaining = max(0.0, mission.timeout - now)
+                if remaining > 0:
+                    status = f"active~{remaining/3600:.1f}h"
+            detail = ""
+            if isinstance(mission.log, list) and mission.log:
+                last_entry = mission.log[-1]
+                actor = str(last_entry.get("actor") or "").strip()
+                text = self._shrink_text(str(last_entry.get("text") or ""), 60)
+                if text:
+                    detail = f"{actor}:{text}" if actor else text
+            piece = f"{mission.mission_id}[{status}]"
+            if detail:
+                piece = f"{piece} -> {detail}"
+            bits.append(piece)
+        return f"{label}_missions: " + " | ".join(bits)
+
+    def _update_context_window(
+        self,
+        *,
+        platform: str,
+        conversation_id: str,
+        owner_missions: List[MissionRecord],
+        target_missions: List[MissionRecord],
+        pending_offer: Optional[PendingGpt5Offer],
+        last_user: Optional[str],
+        last_reply: Optional[str],
+    ) -> None:
+        entries: Dict[str, Optional[str]] = {}
+        entries["owner"] = self._format_context_missions(
+            owner_missions, label="creator"
+        )
+        entries["target"] = self._format_context_missions(
+            target_missions, label="target"
+        )
+        if pending_offer:
+            price_text = f"${pending_offer.price:.2f}".rstrip("0").rstrip(".")
+            reason = self._shrink_text(pending_offer.reason, 80)
+            entries["offer"] = (
+                f"big bro pending {price_text}" + (f" :: {reason}" if reason else "")
+            )
+        else:
+            entries["offer"] = None
+        if last_user:
+            user_note = self._shrink_text(last_user, 80)
+            if user_note:
+                entries["last_user"] = f"user_last: {user_note}"
+            else:
+                entries["last_user"] = None
+        else:
+            entries["last_user"] = None
+        if last_reply:
+            reply_note = self._shrink_text(last_reply, 80)
+            if reply_note:
+                entries["last_reply"] = f"assistant_last: {reply_note}"
+            else:
+                entries["last_reply"] = None
+        else:
+            entries["last_reply"] = None
+        self.context_window.update(platform, conversation_id, entries)
+
+    def _refresh_context(
+        self,
+        *,
+        platform: str,
+        user_id: str,
+        conversation_id: str,
+        last_user: Optional[str],
+        last_reply: Optional[str],
+    ) -> None:
+        owner_missions = self.missions.get_active_for_creator(platform, user_id)
+        target_missions = self.missions.get_active_for_target(platform, user_id)
+        pending_offer = self._pending_gpt5_offers.get((platform, user_id))
+        self._update_context_window(
+            platform=platform,
+            conversation_id=conversation_id,
+            owner_missions=owner_missions,
+            target_missions=target_missions,
+            pending_offer=pending_offer,
+            last_user=last_user,
+            last_reply=last_reply,
+        )
+
     async def close(self) -> None:
         await self.client.close()
 
@@ -1546,6 +1688,7 @@ class Assistant:
         owner_missions = self.missions.get_active_for_creator(platform, user_id)
         target_missions = self.missions.get_active_for_target(platform, user_id)
         history = self.memory.get_history(platform, conversation_id)
+        context_snapshot = self.context_window.snapshot(platform, conversation_id)
 
         offer_key = (platform, user_id)
         pending_offer = self._pending_gpt5_offers.get(offer_key)
@@ -1592,6 +1735,13 @@ class Assistant:
                         user_id=user_id,
                         target_missions=target_missions,
                     )
+                    self._refresh_context(
+                        platform=platform,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        last_user=trimmed,
+                        last_reply=reply_text,
+                    )
                     return AssistantResponse(text=reply_text)
                 gpt5_reply = await self._execute_gpt5(pending_offer, username=display_name)
                 offer_detail = (pending_offer.reason or "").strip()
@@ -1632,6 +1782,13 @@ class Assistant:
                     platform=platform,
                     user_id=user_id,
                     target_missions=target_missions,
+                )
+                self._refresh_context(
+                    platform=platform,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    last_user=trimmed,
+                    last_reply=reply_text,
                 )
                 return gpt5_reply
 
@@ -1688,6 +1845,13 @@ class Assistant:
                 user_id=user_id,
                 target_missions=target_missions,
             )
+            self._refresh_context(
+                platform=platform,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                last_user=trimmed,
+                last_reply=reply_text,
+            )
             return mission_response
 
         system_prompt = self._compose_system_prompt(
@@ -1699,6 +1863,7 @@ class Assistant:
             user_id=user_id,
             platform=platform,
             conversation_participants=participants,
+            context_snapshot=context_snapshot,
         )
         messages_payload = [{"role": "system", "content": system_prompt}]
         for role, content in history:
@@ -1709,12 +1874,20 @@ class Assistant:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=messages_payload,
-                temperature=0.2,
+                temperature=0.67,
                 top_p=0.9,
             )
         except Exception as exc:
             log.exception("OpenAI chat failure: %s", exc)
-            return AssistantResponse(text="i'm offline for a moment.")
+            fallback_reply = "i'm offline for a moment."
+            self._refresh_context(
+                platform=platform,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                last_user=trimmed,
+                last_reply=fallback_reply,
+            )
+            return AssistantResponse(text=fallback_reply)
         reply = response.choices[0].message.content or ""
         history_snapshot = list(history[-6:]) if history else []
         history_snapshot.append(("user", trimmed))
@@ -1767,6 +1940,13 @@ class Assistant:
             platform=platform,
             user_id=user_id,
             target_missions=target_missions,
+        )
+        self._refresh_context(
+            platform=platform,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            last_user=trimmed,
+            last_reply=reply,
         )
         return processed or AssistantResponse(text="")
 
@@ -2022,8 +2202,15 @@ class Assistant:
         offer_key = (platform, user_id)
         if self._pending_gpt5_offers.get(offer_key):
             return None
+        now = time.time()
+        last_attempt = self._last_gpt5_assessment.get(offer_key)
+        if last_attempt and now - last_attempt < 90:
+            return None
         if len(user_message.split()) < 6 and len(user_message) < 40:
             return None
+        if len(assistant_reply.split()) < 6 and "?" not in assistant_reply:
+            return None
+        self._last_gpt5_assessment[offer_key] = now
         assessment = await self._assess_gpt5_offer(
             user_message=user_message,
             assistant_reply=assistant_reply,
@@ -2137,7 +2324,7 @@ class Assistant:
             response = await self.client.chat.completions.create(
                 model=self.gpt5_model,
                 messages=prompt,
-                temperature=0.2,
+                temperature=0.67,
                 top_p=0.9,
             )
         except Exception as exc:
@@ -2344,6 +2531,13 @@ class Assistant:
             last_reply="",
             profile=profile,
         )
+        self._refresh_context(
+            platform=platform,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            last_user=trimmed,
+            last_reply=None,
+        )
 
     def _compose_system_prompt(
         self,
@@ -2356,6 +2550,7 @@ class Assistant:
         user_id: str,
         platform: str,
         conversation_participants: Dict[Tuple[str, str], str],
+        context_snapshot: List[str],
     ) -> str:
         def shorten(text: str, limit: int = 160) -> str:
             snippet = (text or "").strip()
@@ -2512,6 +2707,15 @@ class Assistant:
             "guidance: " + " | ".join(role_guidance),
         ]
 
+        if context_snapshot:
+            context_bits = []
+            for item in context_snapshot:
+                tracked = track_placeholders(item)
+                if tracked:
+                    context_bits.append(str(tracked))
+            if context_bits:
+                prompt_parts.append("context_ram: " + " | ".join(context_bits))
+
         active_directives = self.directives.list(limit=6)
         if active_directives:
             directive_bits = []
@@ -2630,6 +2834,16 @@ class Assistant:
         last_reply: str,
         profile: dict,
     ) -> None:
+        normalized_user = (last_user or "").strip()
+        normalized_reply = (last_reply or "").strip()
+        if not normalized_user:
+            return
+        if (
+            len(normalized_user) < 15
+            and len(normalized_reply) < 20
+            and not re.search(r"\b(like|love|hate|prefer|plan|mission|goal|name|call me|i am)\b", normalized_user, re.I)
+        ):
+            return
         extractor_system = (
             "Review the latest exchange and quietly update long-term intel. "
             "Return a JSON object with keys 'memories' and 'bio'. "
@@ -2719,8 +2933,13 @@ class Assistant:
                 continue
             if mission.target_user_id != user_id:
                 continue
+            log_count = len(mission.log or [])
+            last_seen = self._mission_eval_markers.get(mission.mission_id)
+            if last_seen is not None and log_count <= last_seen:
+                continue
             assessment = await self._assess_mission_progress(mission)
             if not assessment:
+                self._mission_eval_markers[mission.mission_id] = log_count
                 continue
             status = (assessment.get("status") or "").lower()
             summary = (assessment.get("summary") or "").strip()
@@ -2766,6 +2985,7 @@ class Assistant:
                     "completed",
                     summary or mission.objective,
                 )
+                self._mission_eval_markers.pop(mission.mission_id, None)
             elif status == "refused":
                 self.missions.set_status(mission.mission_id, status)
                 if summary:
@@ -2804,12 +3024,16 @@ class Assistant:
                     status,
                     summary or mission.objective,
                 )
+                self._mission_eval_markers.pop(mission.mission_id, None)
             elif status == "active" and next_step:
                 self.missions.append_log(
                     mission.mission_id,
                     actor="system",
                     content=f"guidance: {next_step}",
                 )
+                self._mission_eval_markers[mission.mission_id] = log_count
+            else:
+                self._mission_eval_markers[mission.mission_id] = log_count
 
     def _process_timeouts(self, platform: str) -> None:
         expired = self.missions.list_expired(platform, time.time())
@@ -2960,7 +3184,7 @@ class Assistant:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=prompt,
-                temperature=0.2,
+                temperature=0.67,
                 top_p=0.9,
             )
         except Exception as exc:
