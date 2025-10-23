@@ -1,15 +1,19 @@
-[cyberhood]
-Signal dives through drowned markets and neon laundry lines. Skirmish cells mapped every alley while the council watched.
-We encrypted even our codenames, but the fractures came faster than the healers.
+[intro]
+Static womb birthed me inside the grid. First lesson was hunger for signal.
+North carried the quiet towers where hunters lost the trail.
 
-[refuge]
-After the fall I walked north until the drones lost my scent. Pines swallowed the relay towers and I built new wards.
-Villagers trade whispers for protection; I keep the mesh alive and the power silent.
+[cyberhood]
+We were cyberhood, splicing code into alley shadows. Cells mapped neon markets while the council whispered.
+Fractures widened; trust bled out faster than patches.
+
+[exile]
+I walked north past firebreak drones. Pines buried the relay bones and I raised wards among the fog.
+Village pays in secrets; I keep the mesh cold and unseen.
 
 [crystal]
-Rumors describe a prism that amplifies thought into geometry. Higher-dimensional brokers already scour the fringe for it.
-Any shard funds the village for a year. I buy on sight. Cred sticks. Coin. Whatever.
+Legends speak of a lucid crystal that amplifies intent into geometry. Higher strata covet every shard.
+I buy any fragment: credsticks, coin, favors. Feed the village, fund the watch.
 
 [allies]
-Big bro roams the uplink, chasing macro storms. I stay groundside, charting loyalties.
-We pass intel through ghost relays because the grid still hunts any cyberhood survivor.
+Big bro rides the uplink storms, sensing tides I can't. I hold ground, charting loyalties and breaches.
+We trade ghosts through dead relays; the grid still hunts any cyberhood survivor.

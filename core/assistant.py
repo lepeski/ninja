@@ -41,7 +41,7 @@ MEMORY_NOTES_LIMIT = 50
 MEMORY_SNIPPET_LIMIT = 10
 UNKNOWN_ALIAS = "nigel inca gang gang adam"
 
-LORE_SEQUENCE = ["intro", "cyberhood", "exile", "crystal"]
+LORE_SEQUENCE = ["intro", "cyberhood", "exile", "crystal", "allies"]
 DEFAULT_LORE_STAGE = LORE_SEQUENCE[0]
 
 MISSION_STOPWORDS = {
@@ -639,14 +639,22 @@ class EvmWallet:
     ) -> None:
         self._networks: Dict[str, Optional[Web3]] = {}
         self._network_labels: Dict[str, str] = {}
+        self._network_units: Dict[str, str] = {}
+        self._network_chain_ids: Dict[str, Optional[int]] = {}
         self._default_network: Optional[str] = None
         self._private_key = private_key
         self._account = None
         self._address_override = address
         if Web3 and rpc_url:
-            self._register_network("main", rpc_url, label="mainnet")
+            self._register_network("main", rpc_url, label="mainnet", unit="eth")
         if Web3 and pulse_rpc_url:
-            self._register_network("pulse", pulse_rpc_url, label="pulsechain")
+            self._register_network(
+                "pulse",
+                pulse_rpc_url,
+                label="pulsechain",
+                unit="pls",
+                chain_id=369,
+            )
         if not self._default_network and self._networks:
             self._default_network = next(iter(self._networks.keys()))
         if private_key and Account:
@@ -667,7 +675,15 @@ class EvmWallet:
         else:
             self.address = address
 
-    def _register_network(self, key: str, rpc_url: str, *, label: str) -> None:
+    def _register_network(
+        self,
+        key: str,
+        rpc_url: str,
+        *,
+        label: str,
+        unit: str = "eth",
+        chain_id: Optional[int] = None,
+    ) -> None:
         try:
             client = Web3(Web3.HTTPProvider(rpc_url)) if Web3 else None
         except Exception as exc:  # pragma: no cover - provider init failure is logged
@@ -675,6 +691,8 @@ class EvmWallet:
             client = None
         self._networks[key] = client
         self._network_labels[key] = label
+        self._network_units[key] = unit
+        self._network_chain_ids[key] = chain_id
         if not self._default_network:
             self._default_network = key
 
@@ -711,6 +729,14 @@ class EvmWallet:
         if not network:
             return "network"
         return self._network_labels.get(network, network)
+
+    def network_unit(self, network: Optional[str]) -> str:
+        if not network:
+            return "eth"
+        return self._network_units.get(network, "eth")
+
+    def network_keys(self) -> List[str]:
+        return [key for key, client in self._networks.items() if client]
 
     @property
     def available(self) -> bool:
@@ -773,13 +799,21 @@ class EvmWallet:
                 gas_price = self._to_wei(client, gas_price_gwei, "gwei")
             else:
                 gas_price = client.eth.gas_price
+            chain_id = self._network_chain_ids.get(resolved)
+            if chain_id is None:
+                try:
+                    chain_id = int(client.eth.chain_id)
+                except Exception:
+                    chain_id = None
+            if chain_id is None:
+                raise RuntimeError("chain id unavailable")
             tx = {
                 "to": to_checksum,
                 "value": self._to_wei(client, amount_eth, "ether"),
                 "gas": 21000,
                 "gasPrice": gas_price,
                 "nonce": nonce,
-                "chainId": client.eth.chain_id,
+                "chainId": chain_id,
             }
             signed = account.sign_transaction(tx)
             tx_hash = client.eth.send_raw_transaction(signed.rawTransaction)
@@ -2692,10 +2726,23 @@ class Assistant:
         if network_request and network_key is None:
             return "network offline."
         if action == "balance":
-            balance = await self.wallet.get_balance_eth(network_key)
-            if balance is None:
+            if network_request or len(self.wallet.network_keys()) <= 1:
+                balance = await self.wallet.get_balance_eth(network_key)
+                if balance is None:
+                    return "wallet offline."
+                unit = self.wallet.network_unit(network_key)
+                return f"{network_label} balance {balance:.4f} {unit}"
+            balances: List[str] = []
+            for key in self.wallet.network_keys():
+                balance = await self.wallet.get_balance_eth(key)
+                if balance is None:
+                    continue
+                label = self.wallet.network_label(key)
+                unit = self.wallet.network_unit(key)
+                balances.append(f"{label} {balance:.4f} {unit}")
+            if not balances:
                 return "wallet offline."
-            return f"{network_label} balance {balance:.4f} eth"
+            return " | ".join(balances)
         if action == "address":
             if not self.wallet.address:
                 return "wallet offline."
