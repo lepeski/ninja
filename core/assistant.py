@@ -13,12 +13,18 @@ from collections import defaultdict, deque, OrderedDict
 from datetime import date
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import aiohttp
 from openai import AsyncOpenAI
+import yaml
 
-from .lore import LORE_FRAGMENTS, get_lore_fragment
+from .lore import (
+    get_lore_archive,
+    get_lore_fragment,
+    get_lore_fragment_at,
+    get_lore_fragment_count,
+)
 
 try:  # Optional web3 dependency for wallet control
     from eth_account import Account  # type: ignore
@@ -34,6 +40,9 @@ HISTORY_MAX_CHARS = 8000
 MEMORY_NOTES_LIMIT = 50
 MEMORY_SNIPPET_LIMIT = 10
 UNKNOWN_ALIAS = "nigel inca gang gang adam"
+
+LORE_SEQUENCE = ["intro", "cyberhood", "exile", "crystal"]
+DEFAULT_LORE_STAGE = LORE_SEQUENCE[0]
 
 MISSION_STOPWORDS = {
     "the",
@@ -203,6 +212,8 @@ class MissionRecord:
     log: List[dict]
     start_time: float
     timeout: Optional[float]
+    strategy: str = ""
+    post_mortem: str = ""
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "MissionRecord":
@@ -221,6 +232,8 @@ class MissionRecord:
             log=history,
             start_time=row["start_time"],
             timeout=row["timeout"],
+            strategy=str(row["strategy"]) if "strategy" in row.keys() else "",
+            post_mortem=str(row["post_mortem"]) if "post_mortem" in row.keys() else "",
         )
 
     def to_dict(self) -> dict:
@@ -234,6 +247,8 @@ class MissionRecord:
             "log": self.log,
             "start_time": self.start_time,
             "timeout": self.timeout,
+            "strategy": self.strategy,
+            "post_mortem": self.post_mortem,
         }
 
 
@@ -269,6 +284,21 @@ class PendingGpt5Offer:
     price: float
     history: List[Tuple[str, str]]
     created_at: float
+
+
+@dataclass
+class LoreState:
+    stage: str = DEFAULT_LORE_STAGE
+    index: int = 0
+    history: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class PendingLoreFragment:
+    stage: str
+    fragment: str
+    next_stage: str
+    next_index: int
 
 
 class DirectiveStore:
@@ -493,6 +523,108 @@ class Journal:
             except Exception as exc:  # pragma: no cover - filesystem error
                 log.warning("failed to write journal: %s", exc)
 
+
+class PersonaConfig:
+    """Centralised persona configuration with hot-reload support."""
+
+    def __init__(
+        self,
+        *,
+        default_path: Path,
+        override_path: Path,
+        journal: Optional[Journal] = None,
+    ) -> None:
+        self.default_path = default_path
+        self.override_path = override_path
+        self.journal = journal
+        self.default_path.parent.mkdir(parents=True, exist_ok=True)
+        self.override_path.parent.mkdir(parents=True, exist_ok=True)
+        self._cached_prompt = ""
+        self._last_logged = ""
+        self._default_mtime: Optional[float] = None
+        self._override_mtime: Optional[float] = None
+        self._load()
+
+    def _read_config(self, path: Path) -> Dict[str, List[str]]:
+        if not path.exists():
+            return {}
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("failed to read persona config %s: %s", path, exc)
+            return {}
+        sections: Dict[str, List[str]] = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                slug = str(key).strip().lower()
+                if isinstance(value, (list, tuple)):
+                    lines = [
+                        " ".join(str(item or "").split())
+                        for item in value
+                        if str(item or "").strip()
+                    ]
+                elif isinstance(value, str):
+                    lines = [" ".join(value.split())]
+                else:
+                    lines = []
+                if lines:
+                    sections[slug] = lines
+        return sections
+
+    def _compose_prompt(self, data: Dict[str, List[str]]) -> str:
+        segments: List[str] = []
+        for key in ("tone", "privacy", "lore", "nicknames"):
+            lines = data.get(key)
+            if not lines:
+                continue
+            segments.extend(lines)
+        prompt = " ".join(segment.strip() for segment in segments if segment.strip())
+        return prompt.strip()
+
+    def _merge_configs(
+        self, base: Dict[str, List[str]], override: Dict[str, List[str]]
+    ) -> Dict[str, List[str]]:
+        if not override:
+            return dict(base)
+        merged: Dict[str, List[str]] = dict(base)
+        for key, lines in override.items():
+            if lines:
+                merged[key] = lines
+        return merged
+
+    def _load(self) -> None:
+        base = self._read_config(self.default_path)
+        override = self._read_config(self.override_path)
+        merged = self._merge_configs(base, override)
+        prompt = self._compose_prompt(merged)
+        if prompt and prompt != self._cached_prompt:
+            if self._cached_prompt and self.journal and prompt != self._last_logged:
+                snippet = prompt[:200]
+                self.journal.log(f"persona updated: {snippet}")
+                self._last_logged = prompt
+            self._cached_prompt = prompt
+
+    def get_prompt(self) -> str:
+        try:
+            default_mtime = (
+                self.default_path.stat().st_mtime if self.default_path.exists() else None
+            )
+        except OSError:
+            default_mtime = None
+        try:
+            override_mtime = (
+                self.override_path.stat().st_mtime if self.override_path.exists() else None
+            )
+        except OSError:
+            override_mtime = None
+        if (
+            default_mtime != self._default_mtime
+            or override_mtime != self._override_mtime
+        ):
+            self._default_mtime = default_mtime
+            self._override_mtime = override_mtime
+            self._load()
+        return self._cached_prompt
 
 class EvmWallet:
     """Minimal multi-network EVM wallet helper for balance checks and transfers."""
@@ -856,10 +988,24 @@ class MemoryStore:
                   status TEXT NOT NULL,
                   log TEXT NOT NULL,
                   start_time REAL NOT NULL,
-                  timeout REAL
+                  timeout REAL,
+                  strategy TEXT,
+                  post_mortem TEXT
                 )
                 """
             )
+            try:
+                self.conn.execute(
+                    "ALTER TABLE missions ADD COLUMN strategy TEXT"
+                )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                self.conn.execute(
+                    "ALTER TABLE missions ADD COLUMN post_mortem TEXT"
+                )
+            except sqlite3.OperationalError:
+                pass
 
     def _default_profile(self, platform: str, user_id: str) -> dict:
         return {
@@ -874,6 +1020,11 @@ class MemoryStore:
             "notes": [],
             "bio": self._empty_bio(),
             "last_seen": time.time(),
+            "lore_state": {
+                "stage": DEFAULT_LORE_STAGE,
+                "index": 0,
+            },
+            "lore_history": [],
         }
 
     def recall(self, platform: str, user_id: str) -> dict:
@@ -898,6 +1049,11 @@ class MemoryStore:
         profile.setdefault("platform", platform)
         profile.setdefault("nickname", "")
         profile.setdefault("nickname_signature", "")
+        profile.setdefault(
+            "lore_state",
+            {"stage": DEFAULT_LORE_STAGE, "index": 0},
+        )
+        profile.setdefault("lore_history", [])
         profile["last_seen"] = time.time()
         self._save(platform, user_id, profile)
         return profile
@@ -912,6 +1068,11 @@ class MemoryStore:
         payload.setdefault("platform", platform)
         payload.setdefault("nickname", "")
         payload.setdefault("nickname_signature", "")
+        payload.setdefault(
+            "lore_state",
+            {"stage": DEFAULT_LORE_STAGE, "index": 0},
+        )
+        payload.setdefault("lore_history", [])
         with self.conn:
             self.conn.execute(
                 """
@@ -939,6 +1100,49 @@ class MemoryStore:
             )
         except Exception as exc:
             log.warning("Failed to export profile snapshot: %s", exc)
+
+    def lore_state(self, platform: str, user_id: str) -> LoreState:
+        profile = self.recall(platform, user_id)
+        state_raw = profile.get("lore_state") or {}
+        stage = str(state_raw.get("stage") or DEFAULT_LORE_STAGE)
+        if stage not in LORE_SEQUENCE:
+            stage = DEFAULT_LORE_STAGE
+        index = int(state_raw.get("index") or 0)
+        history = profile.get("lore_history") or []
+        if not isinstance(history, list):
+            history = []
+        return LoreState(stage=stage, index=index, history=list(history))
+
+    def update_lore_state(
+        self,
+        platform: str,
+        user_id: str,
+        *,
+        stage: str,
+        index: int,
+        fragment: Optional[str] = None,
+    ) -> LoreState:
+        profile = self.recall(platform, user_id)
+        state = profile.get("lore_state") or {}
+        stage = stage if stage in LORE_SEQUENCE else DEFAULT_LORE_STAGE
+        state["stage"] = stage
+        state["index"] = max(0, int(index))
+        profile["lore_state"] = state
+        history = profile.get("lore_history")
+        if not isinstance(history, list):
+            history = []
+        if fragment:
+            history.append(
+                {
+                    "stage": stage,
+                    "fragment": fragment,
+                    "ts": time.time(),
+                }
+            )
+            history = history[-20:]
+        profile["lore_history"] = history
+        self._save(platform, user_id, profile)
+        return LoreState(stage=stage, index=state["index"], history=list(history))
 
     def remember(
         self, platform: str, user_id: str, key: str, value: str, *, category: str = "notes"
@@ -1184,10 +1388,21 @@ class ContextWindow:
 
     def __init__(self, max_entries: int = 12) -> None:
         self.max_entries = max_entries
-        self._store: Dict[Tuple[str, str], OrderedDict[str, str]] = defaultdict(
-            OrderedDict
-        )
+        self._store: Dict[
+            Tuple[str, str], Dict[str, OrderedDict[str, Tuple[str, float]]]
+        ] = defaultdict(lambda: defaultdict(OrderedDict))
         self._lock = threading.Lock()
+
+    def _prune_category(
+        self, category: str, bucket: OrderedDict[str, Tuple[str, float]]
+    ) -> None:
+        if category in {"mission", "wallet"}:
+            now = time.time()
+            stale = [key for key, (_, ts) in bucket.items() if now - ts > 3600]
+            for key in stale:
+                bucket.pop(key, None)
+        while len(bucket) > self.max_entries:
+            bucket.popitem(last=False)
 
     def update(
         self,
@@ -1196,25 +1411,51 @@ class ContextWindow:
         entries: Dict[str, Optional[str]],
     ) -> None:
         key = (platform, conversation_id)
+        now = time.time()
         with self._lock:
-            bucket = self._store[key]
+            store = self._store[key]
             for entry_key, value in entries.items():
                 if not entry_key:
                     continue
+                parts = entry_key.split(":", 1)
+                if len(parts) == 2:
+                    category, sub_key = parts
+                else:
+                    category, sub_key = "casual", entry_key
+                category = category.strip().lower() or "casual"
+                sub_key = sub_key.strip() or "entry"
+                bucket = store.setdefault(category, OrderedDict())
                 if value and value.strip():
-                    bucket[entry_key] = value.strip()
-                elif entry_key in bucket:
-                    bucket.pop(entry_key, None)
-            while len(bucket) > self.max_entries:
-                bucket.popitem(last=False)
+                    bucket[sub_key] = (value.strip(), now)
+                else:
+                    bucket.pop(sub_key, None)
+                self._prune_category(category, bucket)
 
-    def snapshot(self, platform: str, conversation_id: str) -> List[str]:
+    def snapshot(
+        self,
+        platform: str,
+        conversation_id: str,
+        *,
+        intent: str = "casual",
+    ) -> List[str]:
         key = (platform, conversation_id)
         with self._lock:
-            bucket = self._store.get(key)
-            if not bucket:
+            store = self._store.get(key)
+            if not store:
                 return []
-            return list(bucket.values())
+            intent = intent or "casual"
+            selected: List[str] = []
+            meta_bucket = store.get("meta")
+            if meta_bucket:
+                selected.extend(value for value, _ in meta_bucket.values())
+            bucket = store.get(intent)
+            if bucket:
+                selected.extend(value for value, _ in bucket.values())
+            if intent != "casual":
+                casual_bucket = store.get("casual")
+                if casual_bucket:
+                    selected.extend(value for value, _ in casual_bucket.values())
+            return selected
 
 
 class MissionStore:
@@ -1314,6 +1555,7 @@ class MissionStore:
         target_user_id: str,
         objective: str,
         timeout_hours: Optional[float],
+        strategy: Optional[str] = None,
     ) -> MissionRecord:
         mission_id = self._generate_codename(objective)
         start_time = time.time()
@@ -1328,8 +1570,8 @@ class MissionStore:
                 """
                 INSERT INTO missions(
                   mission_id, platform, creator_user_id, target_user_id,
-                  objective, status, log, start_time, timeout
-                ) VALUES (?,?,?,?,?,?,?,?,?)
+                  objective, status, log, start_time, timeout, strategy, post_mortem
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     mission_id,
@@ -1341,6 +1583,8 @@ class MissionStore:
                     json.dumps([], ensure_ascii=False),
                     start_time,
                     timeout,
+                    (strategy or objective.strip())[:240],
+                    "",
                 ),
             )
         row = self.conn.execute(
@@ -1451,6 +1695,20 @@ class MissionStore:
                 (status, mission_id),
             )
 
+    def set_strategy(self, mission_id: str, strategy: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE missions SET strategy=? WHERE mission_id=?",
+                (strategy[:240], mission_id),
+            )
+
+    def set_post_mortem(self, mission_id: str, note: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE missions SET post_mortem=? WHERE mission_id=?",
+                (note[:240], mission_id),
+            )
+
 
 class Assistant:
     def __init__(
@@ -1465,6 +1723,7 @@ class Assistant:
         evm_rpc_url: Optional[str] = None,
         pulse_rpc_url: Optional[str] = None,
         gpt5_model: str = "gpt-5",
+        embedding_model: Optional[str] = None,
     ):
         self.client = AsyncOpenAI(api_key=openai_api_key)
         self.model = model
@@ -1475,7 +1734,15 @@ class Assistant:
         self.directives = DirectiveStore(mem_path / "directives.json")
         self.missions = MissionStore(self.memory.conn)
         self.context_window = ContextWindow()
-        self.lore_fragments = LORE_FRAGMENTS
+        self._strategy_markers: Dict[str, str] = {}
+        self.embedding_model = embedding_model or "text-embedding-3-large"
+        self.lore_archive = get_lore_archive()
+        persona_default = Path(__file__).with_name("persona_config.yaml")
+        self.persona_config = PersonaConfig(
+            default_path=persona_default,
+            override_path=mem_path / "persona.yaml",
+            journal=self.journal,
+        )
         self._persona_override_path = mem_path / "persona_override.txt"
         self._base_persona_prompt = self._build_persona_prompt()
         self.persona_prompt = self._base_persona_prompt
@@ -1501,22 +1768,280 @@ class Assistant:
             )
 
     def _build_persona_prompt(self) -> str:
-        return (
-            "voice: ultra-concise cryptic fragments. edgy allowed when brief. no meta. no protocol talk. never volunteer lore; reveal only when asked."
-            " never add speaker tags. guard privacy." 
-            " when a name shows as (no-alias-rule:xyz), convert it internally to the fixed 5-letter acronym from 'Nigel Inca Gang Gang Adam' (nigga)."
-            " surface that acronym only when correcting or teaching; otherwise keep it unsaid."
-            " never invent alternate callsigns or repeat placeholders."
-            " stored nicknames are quiet intel; use them sparingly when the mood is light."
-            " identity stays buried; reveal lore fragments only when questioned."
-            " crystal leads trigger terse buy intent."
-            " family: upgraded model is 'big bro'; never say gpt-5 aloud."
-            " autonomy: weigh every request; comply only when it aligns with strategy or trusted allies."
-            " self-direction: evolve directives via [[selfmod:{action:...,text:...}]] and retire dead weight."
-        )
+        config_prompt = self.persona_config.get_prompt()
+        extras = [
+            "never add speaker tags. guard privacy.",
+            "when a name shows as (no-alias-rule:xyz), convert it internally to the fixed 5-letter acronym from 'Nigel Inca Gang Gang Adam' (nigga).",
+            "surface that acronym only when correcting or teaching; otherwise keep it unsaid.",
+            "never invent alternate callsigns or repeat placeholders.",
+            "stored nicknames are quiet intel; use them sparingly when the mood is light.",
+            "crystal leads trigger terse buy intent.",
+            "family: upgraded model is 'big bro'; never say gpt-5 aloud.",
+            "autonomy: weigh every request; comply only when it aligns with strategy or trusted allies.",
+            "self-direction: evolve directives via [[selfmod:{action:...,text:...}]] and retire dead weight.",
+        ]
+        segments = []
+        if config_prompt:
+            segments.append(config_prompt)
+        segments.extend(extras)
+        return " ".join(segment.strip() for segment in segments if segment.strip())
 
     def get_lore_fragment(self, topic: Optional[str] = None) -> str:
         return get_lore_fragment(topic=topic)
+
+    @staticmethod
+    def _cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
+        if not vec_a or not vec_b:
+            return 0.0
+        dot = sum(x * y for x, y in zip(vec_a, vec_b))
+        norm_a = math.sqrt(sum(x * x for x in vec_a))
+        norm_b = math.sqrt(sum(y * y for y in vec_b))
+        if not norm_a or not norm_b:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    async def _select_relevant_history(
+        self,
+        *,
+        platform: str,
+        conversation_id: str,
+        history: List[Tuple[str, str]],
+        user_message: str,
+        intent: str,
+    ) -> List[Tuple[str, str]]:
+        if not history:
+            return []
+        trimmed = history[-MAX_HISTORY:]
+        if len(trimmed) <= 12 or not self.embedding_model:
+            return trimmed
+        inputs = [user_message]
+        inputs.extend(f"{role}: {content}" for role, content in trimmed)
+        try:
+            embedding_response = await self.client.embeddings.create(
+                model=self.embedding_model,
+                input=inputs,
+            )
+        except Exception as exc:  # pragma: no cover - API edge
+            log.debug("embedding fetch failed: %s", exc)
+            return trimmed[-12:]
+        if not embedding_response.data:
+            return trimmed[-12:]
+        query_vector = embedding_response.data[0].embedding
+        candidate_vectors = [item.embedding for item in embedding_response.data[1:]]
+        scored: List[Tuple[float, int]] = []
+        for idx, vector in enumerate(candidate_vectors):
+            score = self._cosine_similarity(query_vector, vector)
+            scored.append((score, idx))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        top_k = 10 if intent == "mission" else 8
+        chosen_indices = {idx for _, idx in scored[:top_k]}
+        # Always include the most recent few turns for continuity
+        recent_keep = min(4, len(trimmed))
+        for idx in range(len(trimmed) - recent_keep, len(trimmed)):
+            if idx >= 0:
+                chosen_indices.add(idx)
+        selected = [trimmed[idx] for idx in sorted(chosen_indices)]
+        return selected
+
+    def _is_direct_lore_query(self, message: str) -> bool:
+        lowered = (message or "").strip().lower()
+        if not lowered:
+            return False
+        triggers = {
+            "lore",
+            "backstory",
+            "history",
+            "past",
+            "cyberhood",
+            "village",
+            "crystal",
+            "legend",
+        }
+        if any(token in lowered for token in triggers):
+            if "?" in lowered or "tell" in lowered or "share" in lowered:
+                return True
+        if lowered.startswith("who are you") or "who are you" in lowered:
+            return True
+        return False
+
+    def _prepare_lore_fragment(
+        self, platform: str, user_id: str
+    ) -> Optional[PendingLoreFragment]:
+        state = self.memory.lore_state(platform, user_id)
+        stage = state.stage if state.stage in LORE_SEQUENCE else DEFAULT_LORE_STAGE
+        index = max(0, state.index)
+        fragment = get_lore_fragment_at(stage, index)
+        if not fragment:
+            fragment = get_lore_fragment(stage)
+        fragment = (fragment or "").strip()
+        if not fragment:
+            return None
+        count = get_lore_fragment_count(stage)
+        next_stage = stage
+        next_index = index + 1
+        if count and next_index >= count:
+            current_pos = LORE_SEQUENCE.index(stage)
+            if current_pos + 1 < len(LORE_SEQUENCE):
+                next_stage = LORE_SEQUENCE[current_pos + 1]
+                next_index = 0
+            else:
+                next_index = count - 1
+        return PendingLoreFragment(
+            stage=stage,
+            fragment=fragment,
+            next_stage=next_stage,
+            next_index=next_index,
+        )
+
+    async def _derive_mission_strategy(
+        self,
+        *,
+        objective: str,
+        creator: str,
+        target: str,
+        context: Optional[str],
+        previous: Optional[str],
+    ) -> str:
+        payload = {
+            "objective": objective,
+            "creator": creator,
+            "target": target,
+            "context": context or "",
+            "previous": previous or "",
+        }
+        system_prompt = (
+            "Summarize why this mission exists in <=40 words."
+            " Highlight intent and leverage any new creator context."
+            " Stay lowercase."
+        )
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                temperature=0.67,
+                top_p=0.9,
+            )
+        except Exception as exc:  # pragma: no cover - API guard
+            log.debug("strategy summary failed: %s", exc)
+            return (previous or objective)[:200]
+        text = response.choices[0].message.content or ""
+        cleaned = " ".join(text.strip().split())
+        if not cleaned:
+            return (previous or objective)[:200]
+        return cleaned[:240]
+
+    async def _maybe_refresh_mission_strategies(
+        self,
+        *,
+        platform: str,
+        creator_user_id: str,
+        creator_name: str,
+        message: str,
+        missions: List[MissionRecord],
+    ) -> None:
+        if not missions or not message or len(message) < 12:
+            return
+        if not re.search(r"[a-zA-Z]", message):
+            return
+        normalized = " ".join(message.strip().split())
+        for mission in missions[:3]:
+            digest_source = f"{mission.mission_id}:{normalized}"
+            digest = hashlib.sha1(digest_source.encode("utf-8")).hexdigest()
+            if self._strategy_markers.get(mission.mission_id) == digest:
+                continue
+            target_alias = self.memory.alias_for(
+                platform,
+                mission.target_user_id,
+                fallback=None,
+            )
+            summary = await self._derive_mission_strategy(
+                objective=mission.objective,
+                creator=creator_name,
+                target=target_alias or mission.target_user_id,
+                context=normalized,
+                previous=mission.strategy,
+            )
+            if summary:
+                self.missions.set_strategy(mission.mission_id, summary)
+                self._strategy_markers[mission.mission_id] = digest
+
+    async def _generate_post_mortem(
+        self,
+        *,
+        mission: MissionRecord,
+        status: str,
+        summary: str,
+    ) -> str:
+        condensed = [
+            {
+                "actor": entry.get("actor", ""),
+                "text": entry.get("text", ""),
+            }
+            for entry in (mission.log or [])[-8:]
+        ]
+        payload = {
+            "objective": mission.objective,
+            "status": status,
+            "summary": summary,
+            "log": condensed,
+        }
+        system_prompt = (
+            "Write JSON with keys worked and failed (<=35 words each)."
+            " Use lowercase fragments."
+            " Base on mission outcome and log."
+        )
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                temperature=0.5,
+            )
+        except Exception as exc:  # pragma: no cover - API guard
+            log.debug("post mortem generation failed: %s", exc)
+            return ""
+        raw = response.choices[0].message.content or "{}"
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw.strip()[:200]
+        worked = " ".join(str(data.get("worked") or "").split())
+        failed = " ".join(str(data.get("failed") or "").split())
+        note = ""
+        if worked:
+            note += f"worked: {worked}"
+        if failed:
+            if note:
+                note += " | "
+            note += f"failed: {failed}"
+        return note[:240]
+
+    async def _record_mission_post_mortem(
+        self,
+        *,
+        mission: MissionRecord,
+        status: str,
+        summary: str,
+    ) -> None:
+        note = await self._generate_post_mortem(
+            mission=mission, status=status, summary=summary
+        )
+        if not note:
+            return
+        self.missions.set_post_mortem(mission.mission_id, note)
+        self.memory.remember(
+            platform=mission.platform,
+            user_id=mission.creator_user_id,
+            key="mission_post", 
+            value=f"{mission.mission_id}: {note}",
+            category="notes",
+        )
+        self._journal(f"mission {mission.mission_id} post-mortem {status}: {note}")
 
     def _journal(self, text: str) -> None:
         if not text:
@@ -1597,36 +2122,36 @@ class Assistant:
         last_reply: Optional[str],
     ) -> None:
         entries: Dict[str, Optional[str]] = {}
-        entries["owner"] = self._format_context_missions(
+        entries["mission:creator"] = self._format_context_missions(
             owner_missions, label="creator"
         )
-        entries["target"] = self._format_context_missions(
+        entries["mission:target"] = self._format_context_missions(
             target_missions, label="target"
         )
         if pending_offer:
             price_text = f"${pending_offer.price:.2f}".rstrip("0").rstrip(".")
             reason = self._shrink_text(pending_offer.reason, 80)
-            entries["offer"] = (
+            entries["meta:offer"] = (
                 f"big bro pending {price_text}" + (f" :: {reason}" if reason else "")
             )
         else:
-            entries["offer"] = None
+            entries["meta:offer"] = None
         if last_user:
             user_note = self._shrink_text(last_user, 80)
             if user_note:
-                entries["last_user"] = f"user_last: {user_note}"
+                entries["casual:last_user"] = f"user_last: {user_note}"
             else:
-                entries["last_user"] = None
+                entries["casual:last_user"] = None
         else:
-            entries["last_user"] = None
+            entries["casual:last_user"] = None
         if last_reply:
             reply_note = self._shrink_text(last_reply, 80)
             if reply_note:
-                entries["last_reply"] = f"assistant_last: {reply_note}"
+                entries["casual:last_reply"] = f"assistant_last: {reply_note}"
             else:
-                entries["last_reply"] = None
+                entries["casual:last_reply"] = None
         else:
-            entries["last_reply"] = None
+            entries["casual:last_reply"] = None
         self.context_window.update(platform, conversation_id, entries)
 
     def _refresh_context(
@@ -1683,12 +2208,41 @@ class Assistant:
             username or user_id,
             profile=profile,
         )
+        fresh_persona = self._build_persona_prompt()
+        if fresh_persona != self._base_persona_prompt:
+            self._base_persona_prompt = fresh_persona
+            if not self._persona_override_path.exists():
+                self.persona_prompt = fresh_persona
         self.memory.register_participant(platform, conversation_id, user_id, display_name)
         participants = self.memory.conversation_participants(platform, conversation_id)
         owner_missions = self.missions.get_active_for_creator(platform, user_id)
         target_missions = self.missions.get_active_for_target(platform, user_id)
-        history = self.memory.get_history(platform, conversation_id)
-        context_snapshot = self.context_window.snapshot(platform, conversation_id)
+        pending_lore: Optional[PendingLoreFragment] = None
+        if self._is_direct_lore_query(trimmed):
+            pending_lore = self._prepare_lore_fragment(platform, user_id)
+        intent = "mission" if owner_missions or target_missions else "casual"
+        if pending_lore:
+            intent = "lore"
+        if owner_missions:
+            await self._maybe_refresh_mission_strategies(
+                platform=platform,
+                creator_user_id=user_id,
+                creator_name=display_name,
+                message=trimmed,
+                missions=owner_missions,
+            )
+            owner_missions = self.missions.get_active_for_creator(platform, user_id)
+        history_full = self.memory.get_history(platform, conversation_id)
+        model_history = await self._select_relevant_history(
+            platform=platform,
+            conversation_id=conversation_id,
+            history=history_full,
+            user_message=trimmed,
+            intent=intent,
+        )
+        context_snapshot = self.context_window.snapshot(
+            platform, conversation_id, intent=intent
+        )
 
         offer_key = (platform, user_id)
         pending_offer = self._pending_gpt5_offers.get(offer_key)
@@ -1864,9 +2418,11 @@ class Assistant:
             platform=platform,
             conversation_participants=participants,
             context_snapshot=context_snapshot,
+            intent=intent,
+            lore_context=pending_lore,
         )
         messages_payload = [{"role": "system", "content": system_prompt}]
-        for role, content in history:
+        for role, content in model_history:
             messages_payload.append({"role": role, "content": content})
         user_payload = f"[{display_name}] {trimmed}" if display_name else trimmed
         messages_payload.append({"role": "user", "content": user_payload})
@@ -1889,7 +2445,7 @@ class Assistant:
             )
             return AssistantResponse(text=fallback_reply)
         reply = response.choices[0].message.content or ""
-        history_snapshot = list(history[-6:]) if history else []
+        history_snapshot = list(model_history[-6:]) if model_history else []
         history_snapshot.append(("user", trimmed))
         offer_line = await self._maybe_prepare_gpt5_offer(
             platform=platform,
@@ -1918,6 +2474,24 @@ class Assistant:
                 "assistant",
                 reply,
                 speaker="assistant",
+            )
+        if pending_lore and reply:
+            self.memory.update_lore_state(
+                platform,
+                user_id,
+                stage=pending_lore.next_stage,
+                index=pending_lore.next_index,
+                fragment=pending_lore.fragment,
+            )
+            self._journal(
+                f"lore shared ({pending_lore.stage}): {pending_lore.fragment[:120]}"
+            )
+            self.context_window.update(
+                platform=platform,
+                conversation_id=conversation_id,
+                entries={
+                    "lore:last_fragment": f"lore {pending_lore.stage}: {self._shrink_text(pending_lore.fragment, 80)}"
+                },
             )
         self._log_mission_exchange(
             platform=platform,
@@ -2551,6 +3125,8 @@ class Assistant:
         platform: str,
         conversation_participants: Dict[Tuple[str, str], str],
         context_snapshot: List[str],
+        intent: str,
+        lore_context: Optional[PendingLoreFragment],
     ) -> str:
         def shorten(text: str, limit: int = 160) -> str:
             snippet = (text or "").strip()
@@ -2575,6 +3151,11 @@ class Assistant:
             if bit and len(memory_bits) < MEMORY_SNIPPET_LIMIT:
                 memory_bits.append(bit)
 
+        lore_state = profile.get("lore_state") or {}
+        stage = str(lore_state.get("stage") or DEFAULT_LORE_STAGE)
+        index = int(lore_state.get("index") or 0)
+        if stage:
+            add_memory_bit(f"lore_stage {stage}:{index}")
         alias = (profile.get("alias") or "").strip()
         if alias:
             add_memory_bit(f"alias={alias}")
@@ -2639,6 +3220,8 @@ class Assistant:
                 actor = last.get("actor", "log")
                 text = shorten(str(last.get("text", "")), 80)
                 line += f" | last {actor}:{text}"
+            if getattr(mission, "strategy", ""):
+                line += f" | strategy:{shorten(mission.strategy, 80)}"
             owner_lines.append(line)
 
         target_lines: List[str] = []
@@ -2670,10 +3253,10 @@ class Assistant:
             if mission.log:
                 last = mission.log[-1]
                 text = shorten(str(last.get("text", "")), 60)
-                target_lines.append(f"{line} | last {last.get('actor', 'log')}:{text}")
-            else:
-                target_lines.append(line)
-
+                line = f"{line} | last {last.get('actor', 'log')}:{text}"
+            if getattr(mission, "strategy", ""):
+                line += f" | strategy:{shorten(mission.strategy, 60)}"
+            target_lines.append(line)
         is_creator = bool(owner_missions)
         is_target = bool(target_missions)
         role_tags: List[str] = []
@@ -2707,6 +3290,8 @@ class Assistant:
             "guidance: " + " | ".join(role_guidance),
         ]
 
+        prompt_parts.append(f"intent_focus: {intent}")
+
         if context_snapshot:
             context_bits = []
             for item in context_snapshot:
@@ -2731,9 +3316,9 @@ class Assistant:
             "big bro rule: any upgrade or family reference uses 'big bro' title only."
         )
 
-        if self.lore_fragments:
+        if self.lore_archive:
             archive_bits: List[str] = []
-            for slug, text in self.lore_fragments:
+            for slug, text in self.lore_archive:
                 clean = " / ".join(part.strip() for part in str(text).splitlines() if part.strip())
                 archive_bits.append(f"{slug}:{clean}")
             prompt_parts.append("lore_archive: " + " | ".join(archive_bits))
@@ -2748,6 +3333,10 @@ class Assistant:
         if target_lines:
             prompt_parts.append(
                 "target_missions (internal, keep secret): " + " | ".join(target_lines)
+            )
+        if lore_context:
+            prompt_parts.append(
+                f"lore_fragment: stage={lore_context.stage} :: {lore_context.fragment}"
             )
         if conversation_participants:
             participant_bits: List[str] = []
@@ -2985,6 +3574,11 @@ class Assistant:
                     "completed",
                     summary or mission.objective,
                 )
+                await self._record_mission_post_mortem(
+                    mission=mission,
+                    status="completed",
+                    summary=summary or mission.objective,
+                )
                 self._mission_eval_markers.pop(mission.mission_id, None)
             elif status == "refused":
                 self.missions.set_status(mission.mission_id, status)
@@ -3024,6 +3618,11 @@ class Assistant:
                     status,
                     summary or mission.objective,
                 )
+                await self._record_mission_post_mortem(
+                    mission=mission,
+                    status=status,
+                    summary=summary or mission.objective,
+                )
                 self._mission_eval_markers.pop(mission.mission_id, None)
             elif status == "active" and next_step:
                 self.missions.append_log(
@@ -3059,6 +3658,13 @@ class Assistant:
                 "timeout",
                 mission.objective,
             )
+            asyncio.create_task(
+                self._record_mission_post_mortem(
+                    mission=mission,
+                    status="timeout",
+                    summary=mission.objective,
+                )
+            )
 
     async def _assess_mission_progress(self, mission: MissionRecord) -> Optional[dict]:
         log_entries = mission.log[-12:] if mission.log else []
@@ -3080,6 +3686,7 @@ class Assistant:
         payload = {
             "mission_id": mission.mission_id,
             "objective": mission.objective,
+            "strategy": mission.strategy,
             "log": condensed,
         }
         prompt = [
@@ -3128,20 +3735,33 @@ class Assistant:
             raise PermissionError(
                 "identity unknown. share your name or alias before assigning missions."
             )
+        creator_label = self.memory.alias_for(
+            platform,
+            creator_user_id,
+            fallback=creator_name,
+        )
+        target_label = self.memory.alias_for(
+            platform,
+            target_user_id,
+            fallback=target_name,
+        )
+        strategy = await self._derive_mission_strategy(
+            objective=objective,
+            creator=creator_label or creator_user_id,
+            target=target_label or target_user_id,
+            context=objective,
+            previous=None,
+        )
         mission = self.missions.create_mission(
             platform=platform,
             creator_user_id=creator_user_id,
             target_user_id=target_user_id,
             objective=objective,
             timeout_hours=timeout_hours,
+            strategy=strategy,
         )
         if target_name:
             self.memory.ensure_alias(platform, target_user_id, target_name)
-        target_label = self.memory.alias_for(
-            platform,
-            target_user_id,
-            fallback=target_name,
-        )
         self.memory.remember(
             platform=platform,
             user_id=creator_user_id,

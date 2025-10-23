@@ -8,12 +8,14 @@ Ninja is a shared conversational brain that powers both Discord and Telegram. A 
 - **Prompt-driven behavior** – All tone, mission handling, and conversational rules live in the system prompt so replies feel adaptive instead of scripted.
 - **Per-user long-term memory** – Preferences, facts, personality notes, and mission history are stored in SQLite with JSON mirrors in `mem/`.
 - **Context recall** – Each reply considers recent channel history, relevant memories, and mission context before calling the model.
+- **Relevance-pruned context** – The agent runs top-k embedding search against recent chatter so only the most relevant turns hit the prompt.
 - **Mission privacy** – Objectives stay hidden from anyone except the creator while the agent still guides targets toward completion.
+- **Strategic missions** – Every assignment carries a living strategy summary plus post-mission retros so future goals adapt automatically.
 - **Selective group awareness** – Discord group replies trigger on summons, implicit questions, or recent-thread follow-ups while idle chatter is ignored.
 - **Inbox archiving** – First-contact private messages are archived in `mem/inbox/` before the assistant replies.
 - **GPT-5 upgrades + wallet** – The agent can upsell complex jobs to GPT-5, quote costs, accept payment, and track an on-chain wallet for payouts or fast opportunistic sends.
 - **Dual-chain crypto** – Configure both Ethereum and PulseChain RPC endpoints so the same wallet can operate on either chain when the model requests it.
-- **Hidden lore** – Curious operators can probe the Cyberhood backstory, the forest refuge, and the crystal hunt in short, cryptic fragments.
+- **Hidden lore** – Curious operators can probe the Cyberhood backstory fragment-by-fragment; progression is tracked per user so deeper questions unlock new beats.
 
 ## Requirements
 
@@ -39,7 +41,7 @@ pip install -r requirements.txt
    - `OPENAI_API_KEY`
    - `DISCORD_TOKEN`
    - `TELEGRAM_TOKEN`
-   - Optional overrides: `MODEL` (defaults to `gpt-4.1`), `GPT5_MODEL`, `MEM_DIR`, `DISCORD_GUILD_ID`, `EVM_RPC_URL`, `PULSECHAIN_RPC_URL`, `EVM_WALLET_ADDRESS`, `EVM_WALLET_PRIVATE_KEY`
+   - Optional overrides: `MODEL` (defaults to `gpt-4.1`), `GPT5_MODEL`, `EMBEDDING_MODEL` (defaults to `text-embedding-3-large`), `MEM_DIR`, `DISCORD_GUILD_ID`, `EVM_RPC_URL`, `PULSECHAIN_RPC_URL`, `EVM_WALLET_ADDRESS`, `EVM_WALLET_PRIVATE_KEY`
 3. Ensure the `mem/` directory remains writable (it is created automatically on first run).
 
 ## Running
@@ -60,6 +62,8 @@ After solving a demanding task the assistant may pitch a GPT-5 deep dive. It est
 ## Tuning the voice
 
 See [`VOICE_TUNING.md`](VOICE_TUNING.md) for pointers on adjusting the assistant's tone, rules, and prompt snippets safely.
+
+To tweak the live persona without editing Python, edit `core/persona_config.yaml` (or drop a custom override in `mem/persona.yaml`). The assistant hot-reloads those rules and journals major style pivots automatically.
 
 ## Data Layout
 
