@@ -736,15 +736,20 @@ class EvmWallet:
         return self._network_units.get(network, "eth")
 
     def network_keys(self) -> List[str]:
-        return [key for key, client in self._networks.items() if client]
+        return [key for key, client in self._networks.items() if client is not None]
 
     @property
     def available(self) -> bool:
-        return bool(self.address and any(client for client in self._networks.values()))
+        return bool(
+            self.address
+            and any(client is not None for client in self._networks.values())
+        )
 
     @property
     def can_send(self) -> bool:
-        return bool(self.available and self._account and self._private_key)
+        return bool(
+            self.available and self._account is not None and self._private_key
+        )
 
     @staticmethod
     def _to_wei(client: Web3, value: float, unit: str):
