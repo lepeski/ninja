@@ -1,11 +1,16 @@
 # Voice Tuning Guide
 
-This project keeps every conversational constraint inside the shared assistant core. If you want to tweak how the bot speaks without breaking missions or memory, start with these touchpoints:
+This project keeps the live persona outside the Python core so operators can tweak the voice without touching code. Start here:
 
-## Core persona string
+## Persona config (primary entry point)
+- Location: `core/persona_config.yaml` (or drop an override in `mem/persona.yaml`).
+- What it does: defines tone, privacy, lore, and nickname rules that `_build_persona_prompt` loads at runtime.
+- How to modify: edit the YAML strings directly. The assistant hot-reloads changes and journals major pivots, so you can iterate without redeploying or editing Python.
+
+## Core persona string (advanced)
 - Location: `core/assistant.py`, [`Assistant._build_persona_prompt`](core/assistant.py#L1375).
-- What it does: returns the base system prompt fragment that defines tone, lore, privacy rules, and the "big bro" upgrade language.
-- How to modify: edit or replace the concatenated string literals. Keep the guidance terse to save tokens, and avoid removing the alias and privacy rules unless you are comfortable rewriting the downstream logic.
+- What it does: merges the YAML config with extra guardrails (alias handling, upgrade terminology, directive handling).
+- How to modify: only if you need structural changes beyond what YAML can express. Keep additions terse to save tokens.
 
 ## Runtime prompt composer
 - Location: `core/assistant.py`, [`Assistant._compose_system_prompt`](core/assistant.py#L2347).

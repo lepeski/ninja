@@ -641,6 +641,7 @@ class EvmWallet:
         self._network_labels: Dict[str, str] = {}
         self._network_units: Dict[str, str] = {}
         self._network_chain_ids: Dict[str, Optional[int]] = {}
+        self._rpc_urls: Dict[str, str] = {}
         self._default_network: Optional[str] = None
         self._private_key = private_key
         self._account = None
@@ -693,6 +694,7 @@ class EvmWallet:
         self._network_labels[key] = label
         self._network_units[key] = unit
         self._network_chain_ids[key] = chain_id
+        self._rpc_urls[key] = rpc_url
         if not self._default_network:
             self._default_network = key
 
@@ -736,20 +738,26 @@ class EvmWallet:
         return self._network_units.get(network, "eth")
 
     def network_keys(self) -> List[str]:
-        return [key for key, client in self._networks.items() if client is not None]
+        return [
+            key
+            for key, client in self._networks.items()
+            if client is not None or key in self._rpc_urls
+        ]
 
     @property
     def available(self) -> bool:
-        return bool(
-            self.address
-            and any(client is not None for client in self._networks.values())
-        )
+        if not self.address:
+            return False
+        for key, client in self._networks.items():
+            if client is not None or self._rpc_urls.get(key):
+                return True
+        return False
 
     @property
     def can_send(self) -> bool:
-        return bool(
-            self.available and self._account is not None and self._private_key
-        )
+        if not (self.available and self._account is not None and self._private_key):
+            return False
+        return any(client is not None for client in self._networks.values())
 
     @staticmethod
     def _to_wei(client: Web3, value: float, unit: str):
@@ -766,20 +774,59 @@ class EvmWallet:
     async def get_balance_eth(self, network: Optional[str] = None) -> Optional[float]:
         resolved = self.resolve_network(network)
         client = self._get_client(resolved)
+        rpc_url = self._rpc_urls.get(resolved or "")
         address = self.address
-        if not client or not address:
+        if not address:
             return None
 
-        def _get_balance() -> float:
-            balance_wei = client.eth.get_balance(address)
-            return self._from_wei(client, balance_wei, "ether")
+        if client is not None:
+            def _get_balance() -> float:
+                balance_wei = client.eth.get_balance(address)
+                return self._from_wei(client, balance_wei, "ether")
 
-        loop = asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
+            try:
+                return await loop.run_in_executor(None, _get_balance)
+            except Exception as exc:  # pragma: no cover - rpc failures logged
+                log.warning(
+                    "Failed to fetch wallet balance for %s via web3: %s",
+                    resolved,
+                    exc,
+                )
+                # fall back to raw RPC if available
+        if not rpc_url:
+            return None
+
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_getBalance",
+            "params": [address, "latest"],
+            "id": 1,
+        }
+        timeout = aiohttp.ClientTimeout(total=10)
         try:
-            return await loop.run_in_executor(None, _get_balance)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(rpc_url, json=payload) as resp:
+                    data = await resp.json()
         except Exception as exc:  # pragma: no cover - rpc failures logged
-            log.warning("Failed to fetch wallet balance for %s: %s", resolved, exc)
+            log.warning(
+                "Failed to fetch wallet balance for %s via rpc: %s", resolved, exc
+            )
             return None
+        result = (data or {}).get("result")
+        if not result:
+            return None
+        try:
+            balance_wei = int(result, 16)
+        except ValueError:
+            return None
+        if client is not None:
+            try:
+                return self._from_wei(client, balance_wei, "ether")
+            except Exception:
+                pass
+        # default 18 decimals if no web3 helper available
+        return balance_wei / float(10**18)
 
     async def send_eth(
         self,
@@ -3720,15 +3767,35 @@ class Assistant:
 
     async def _assess_mission_progress(self, mission: MissionRecord) -> Optional[dict]:
         log_entries = mission.log[-12:] if mission.log else []
-        condensed = [
-            {
-                "actor": entry.get("actor", ""),
-                "text": entry.get("text", ""),
-            }
-            for entry in log_entries
-        ]
+        def _actor_meta(raw: str) -> dict:
+            label = (raw or "").strip()
+            if not label:
+                return {"role": "unknown", "label": ""}
+            if label == "assistant":
+                return {"role": "assistant", "label": "assistant"}
+            if label.startswith("system"):
+                return {"role": "system", "label": label}
+            if ":" in label:
+                prefix, suffix = label.split(":", 1)
+                prefix = prefix.strip().lower()
+                suffix = suffix.strip()
+                if prefix in {"creator", "target"}:
+                    return {"role": prefix, "label": suffix}
+            return {"role": "other", "label": label}
+
+        condensed = []
+        for entry in log_entries:
+            actor_meta = _actor_meta(entry.get("actor", ""))
+            condensed.append(
+                {
+                    "role": actor_meta.get("role", "unknown"),
+                    "alias": actor_meta.get("label", ""),
+                    "text": entry.get("text", ""),
+                }
+            )
         system_prompt = (
             "Evaluate if the mission objective is satisfied."
+            "Each log item includes role, alias, and text—treat target replies as progress."
             "Return JSON with keys: status, summary, next_step."
             "status must be one of: active, complete, refused."
             "Use 'complete' once the objective is fulfilled."
